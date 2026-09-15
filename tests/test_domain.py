@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.domain import AppError, MockSourceProvider, RuleBasedAnalyzer, Store, buzz_score
+from app.domain import AppError, MockSourceProvider, RuleBasedAnalyzer, RuleBasedMatcher, Store, buzz_score
 
 
 class WorkflowTest(unittest.TestCase):
@@ -119,6 +119,134 @@ class WorkflowTest(unittest.TestCase):
         self.assertTrue(checked["drafts"][0]["checks"]["passed"])
         self.assertNotIn(source["text"], draft["text"])
 
+    def _set_campaign_fields(self, campaign, **overrides):
+        payload = {
+            "id": campaign["id"], "name": campaign["name"], "network": campaign["network"], "url": campaign["url"],
+            "affiliate_url": campaign["affiliate_url"], "category": campaign["category"], "target": campaign["target"],
+            "appeal_points": campaign["appeal_points"], "reward_conditions": campaign["reward_conditions"],
+            "prohibited_expressions": campaign["prohibited_expressions"], "reward_yen": campaign["reward_yen"],
+            "status": campaign["status"], "notes": campaign["notes"],
+        }
+        payload.update(overrides)
+        return next(c for c in self.store.mutate("/api/campaigns", payload)["campaigns"] if c["id"] == campaign["id"])
+
+    def test_plan_generation_excludes_non_approved_campaigns(self):
+        state = self.store.state()
+        candidate = next(c for c in state["campaigns"] if c["status"] == "candidate")
+        source = state["sources"][0]
+        with self.assertRaises(AppError) as error:
+            self.store.mutate("/api/plans/generate", {"campaign_id": candidate["id"], "source_id": source["id"], "angle": ""})
+        self.assertEqual(409, error.exception.status)
+        self.assertFalse(any(m["campaign_id"] == candidate["id"] for m in state["matches"]))
+
+    def test_prohibited_expression_is_detected_in_check(self):
+        campaign = self.approved_campaign()
+        campaign = self._set_campaign_fields(campaign, prohibited_expressions=["今だけ特別価格"])
+        state = self.store.mutate("/api/drafts/save", {
+            "title": "禁止表現テスト", "text": "【PR】\n今だけ特別価格でご案内。\n" + campaign["affiliate_url"],
+            "campaign_id": campaign["id"], "source_id": None,
+        })
+        draft = state["drafts"][0]
+        checked = self.store.mutate("/api/drafts/check", {"id": draft["id"]})
+        codes = {i["code"] for i in checked["drafts"][0]["checks"]["issues"]}
+        self.assertIn("prohibited_expression", codes)
+        self.assertFalse(checked["drafts"][0]["checks"]["passed"])
+
+    def test_plan_to_draft_to_check_chain_does_not_copy_original_text_and_passes(self):
+        state = self.store.state()
+        campaign = self.approved_campaign()
+        source = state["sources"][0]
+        state = self.store.mutate("/api/plans/generate", {"campaign_id": campaign["id"], "source_id": source["id"], "angle": ""})
+        plan = state["plans"][0]
+        self.assertEqual(campaign["id"], plan["campaign_id"])
+        self.assertEqual(source["id"], plan["source_id"])
+        self.assertIsInstance(plan["match_score"], int)
+        for key in ("target", "theme", "hook", "structure", "appeal", "cta"):
+            self.assertIn(key, plan)
+
+        state = self.store.mutate("/api/drafts/generate-from-plan", {"plan_id": plan["id"]})
+        draft = state["drafts"][0]
+        self.assertEqual(plan["id"], draft["plan_id"])
+        self.assertNotIn(source["text"], draft["text"])
+        self.assertIn("【PR】", draft["text"])
+        self.assertIn(campaign["affiliate_url"], draft["text"])
+
+        checked = self.store.mutate("/api/drafts/check", {"id": draft["id"]})
+        self.assertTrue(checked["drafts"][0]["checks"]["passed"])
+
+    def test_profile_change_invalidates_draft_generated_from_plan(self):
+        campaign = self.approved_campaign()
+        source = self.store.state()["sources"][0]
+        state = self.store.mutate("/api/plans/generate", {"campaign_id": campaign["id"], "source_id": source["id"], "angle": ""})
+        plan = state["plans"][0]
+        state = self.store.mutate("/api/drafts/generate-from-plan", {"plan_id": plan["id"]})
+        draft = state["drafts"][0]
+        self.store.mutate("/api/drafts/check", {"id": draft["id"]})
+        self.store.mutate("/api/drafts/approve", {"id": draft["id"], "confirmed": True})
+
+        profile = self.store.state()["profile"]
+        state = self.store.mutate("/api/profile", dict(profile, bio=profile["bio"] + "（更新）"))
+        changed = next(d for d in state["drafts"] if d["id"] == draft["id"])
+        self.assertEqual("draft", changed["status"])
+        self.assertIsNone(changed["checks"])
+
+    def test_match_score_shown_in_state_matches_score_saved_on_plan(self):
+        # 表示スコアと企画作成時に保存されるスコアが同じ分析結果（同じ audience）から算出されることの回帰テスト。
+        campaign = self.approved_campaign()
+        source = self.store.state()["sources"][0]
+        shown = next(m["score"] for m in self.store.state()["matches"] if m["campaign_id"] == campaign["id"] and m["source_id"] == source["id"])
+        state = self.store.mutate("/api/plans/generate", {"campaign_id": campaign["id"], "source_id": source["id"], "angle": ""})
+        plan = state["plans"][0]
+        self.assertEqual(shown, plan["match_score"])
+
+    def test_match_reasons_use_japanese_appeal_labels_not_raw_keys(self):
+        campaign = self.approved_campaign()
+        campaign = self._set_campaign_fields(campaign, appeal_points="知らないと損する、今だけの特別な条件です。")
+        state = self.store.mutate("/api/sources", {
+            "text": "知らないと損する投稿の作り方。今だけ限定で公開します。", "url": "https://x.com/appealtest/status/1",
+            "author": "訴求テスト", "likes": 5, "reposts": 1, "replies": 1, "impressions": 100, "topic": campaign["category"],
+            "posted_at": "2026-09-14T10:00:00Z", "followers": 100,
+        })
+        source = state["sources"][0]
+        match = next(m for m in state["matches"] if m["campaign_id"] == campaign["id"] and m["source_id"] == source["id"])
+        reason_text = " ".join(match["reasons"])
+        self.assertIn("共通する訴求パターン", reason_text)
+        self.assertNotIn("curiosity", reason_text)
+        self.assertNotIn("urgency", reason_text)
+
+    def test_draft_plan_id_cleared_when_reassigned_to_another_campaign(self):
+        state = self.store.state()
+        campaign_a = self.approved_campaign()
+        source = state["sources"][0]
+        state = self.store.mutate("/api/plans/generate", {"campaign_id": campaign_a["id"], "source_id": source["id"], "angle": ""})
+        plan = state["plans"][0]
+        state = self.store.mutate("/api/drafts/generate-from-plan", {"plan_id": plan["id"]})
+        draft = state["drafts"][0]
+        self.assertEqual(plan["id"], draft["plan_id"])
+
+        # 同じ案件・参考投稿のまま本文だけ編集した場合は plan_id を維持する。
+        state = self.store.mutate("/api/drafts/save", {
+            "id": draft["id"], "title": draft["title"], "text": draft["text"] + "\n追記",
+            "campaign_id": draft["campaign_id"], "source_id": draft["source_id"],
+        })
+        unchanged = next(d for d in state["drafts"] if d["id"] == draft["id"])
+        self.assertEqual(plan["id"], unchanged["plan_id"])
+
+        # 別の案件を新規登録し、そちらへ付け替えると plan_id は外れる。
+        state = self.store.mutate("/api/campaigns", {
+            "name": "別案件", "network": "デモASP", "url": "https://example.com/other",
+            "affiliate_url": "https://example.com/other-aff", "category": "その他", "target": "", "appeal_points": "",
+            "reward_conditions": "", "prohibited_expressions": [], "reward_yen": 100, "status": "approved", "notes": "",
+        })
+        campaign_b = next(c for c in state["campaigns"] if c["name"] == "別案件")
+        state = self.store.mutate("/api/drafts/save", {
+            "id": draft["id"], "title": draft["title"], "text": draft["text"],
+            "campaign_id": campaign_b["id"], "source_id": draft["source_id"],
+        })
+        reassigned = next(d for d in state["drafts"] if d["id"] == draft["id"])
+        self.assertIsNone(reassigned["plan_id"])
+        self.assertEqual(campaign_b["id"], reassigned["campaign_id"])
+
 
 class PureFunctionTest(unittest.TestCase):
     def test_buzz_score_rewards_reach_relative_to_followers(self):
@@ -135,6 +263,19 @@ class PureFunctionTest(unittest.TestCase):
         self.assertEqual("follow", analysis["cta"])
         self.assertIn("curiosity", analysis["appeals"])
         self.assertEqual("節約", analysis["theme"])
+
+    def test_matcher_scores_aligned_campaign_higher_than_mismatched(self):
+        matcher = RuleBasedMatcher()
+        content = {"theme": "節約", "target": "家計を見直したい人", "appeals": ["curiosity", "number"], "structure": "list"}
+        profile = {"niche": "節約と家計管理", "pillars": "固定費の見直し、節約術"}
+        aligned_campaign = {"category": "節約", "target": "家計を見直したい人", "appeal_points": "知らないと損する固定費の見直し術"}
+        mismatched_campaign = {"category": "旅行", "target": "海外旅行が好きな人", "appeal_points": "豪華な特典付きツアー"}
+        aligned = matcher.match(aligned_campaign, content, profile)
+        mismatched = matcher.match(mismatched_campaign, content, profile)
+        self.assertGreater(aligned["score"], mismatched["score"])
+        self.assertTrue(0 <= aligned["score"] <= 100)
+        self.assertTrue(0 <= mismatched["score"] <= 100)
+        self.assertTrue(aligned["reasons"])
 
     def test_mock_source_provider_filters_by_genre_and_keyword(self):
         provider = MockSourceProvider()

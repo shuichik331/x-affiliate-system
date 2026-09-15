@@ -232,6 +232,8 @@ APPEAL_PATTERNS = {
     "urgency": re.compile(r"(?:今すぐ|今だけ|残り|締切|損する)"),
     "curiosity": re.compile(r"(?:知らないと|実は|意外)"),
 }
+# app/static/app.js の appealLabel と対応。ユーザー向け文言（マッチ理由など）に生のキーを出さないための表示名。
+APPEAL_LABELS_JA = {"number": "数字訴求", "authority": "権威訴求", "empathy": "共感訴求", "urgency": "緊急性訴求", "curiosity": "好奇心訴求"}
 
 
 def _classify(text, patterns, default):
@@ -337,6 +339,101 @@ class MockSourceProvider(SourceProvider):
         return results
 
 
+# --- 案件マッチング: 将来 AI 判定へ差し替え可能な構造 -------------------------
+def _bigrams(text):
+    text = re.sub(r"\s+", "", text or "")
+    if len(text) < 2:
+        return {text} if text else set()
+    return {text[i:i + 2] for i in range(len(text) - 1)}
+
+
+def _similarity(a, b):
+    """0〜1 の粗い類似度（文字バイグラムの Jaccard 係数）。専用の形態素解析器を使わない簡易実装。"""
+    set_a, set_b = _bigrams(a), _bigrams(b)
+    if not set_a or not set_b:
+        return 0.0
+    return len(set_a & set_b) / len(set_a | set_b)
+
+
+class CampaignMatcher:
+    """将来 AI 判定に差し替えるための共通インターフェース。"""
+
+    def match(self, campaign, content, profile):
+        raise NotImplementedError
+
+
+class RuleBasedMatcher(CampaignMatcher):
+    """類似度と訴求パターンの重なりから 0〜100 のマッチ度を算出する既定実装。
+
+    内訳: ジャンル一致35点 + ターゲット一致25点 + 訴求パターン一致20点 + 発信方針との整合20点。
+    投稿の構成（structure）は比較の参考情報として理由に含めるが、案件側に対応する項目がないためスコアには含めない。
+    """
+
+    def match(self, campaign, content, profile):
+        reasons = []
+
+        genre_score = round(_similarity(campaign["category"], content["theme"]) * 35)
+        if genre_score >= 15:
+            reasons.append("案件のジャンル「" + campaign["category"] + "」と投稿テーマ「" + content["theme"] + "」が近い")
+        else:
+            reasons.append("案件のジャンル「" + campaign["category"] + "」と投稿テーマ「" + content["theme"] + "」の重なりが薄い")
+
+        target_score = round(_similarity(campaign["target"], content["target"]) * 25)
+        if target_score >= 10:
+            reasons.append("案件のターゲットと投稿の想定読者が近い")
+        else:
+            reasons.append("案件のターゲットと投稿の想定読者が異なる可能性がある")
+
+        appeal_categories = {name for name, pattern in APPEAL_PATTERNS.items() if pattern.search(campaign["appeal_points"])}
+        shared_appeals = appeal_categories & set(content["appeals"])
+        appeal_score = min(20, len(shared_appeals) * 10)
+        if shared_appeals:
+            reasons.append("共通する訴求パターン: " + "、".join(APPEAL_LABELS_JA.get(name, name) for name in sorted(shared_appeals)))
+        else:
+            reasons.append("案件の訴求ポイントと投稿の訴求パターンに共通点が見つからない")
+
+        profile_text = (profile.get("niche") or "") + " " + (profile.get("pillars") or "")
+        campaign_text = campaign["category"] + " " + campaign["target"]
+        profile_score = round(_similarity(profile_text, campaign_text) * 20)
+        if profile_score >= 8:
+            reasons.append("発信テーマ・発信の柱と案件の方向性が近い")
+        else:
+            reasons.append("発信テーマ・発信の柱と案件の方向性がずれている可能性がある")
+
+        reasons.append("投稿の構成タイプ: " + content["structure"] + "（参考情報。スコアには含めない）")
+
+        score = min(100, genre_score + target_score + appeal_score + profile_score)
+        return {"score": score, "reasons": reasons}
+
+
+DEFAULT_MATCHER = RuleBasedMatcher()
+
+
+# --- 下書き生成: 将来 LLM Provider へ差し替え可能な構造 -----------------------
+class DraftGenerator:
+    """将来 LLM ベースの生成に差し替えるための共通インターフェース。"""
+
+    def generate(self, plan, campaign, profile):
+        raise NotImplementedError
+
+
+class RuleBasedDraftGenerator(DraftGenerator):
+    """投稿企画の分類ラベルからテンプレートで本文を組み立てる既定実装。原文は使用しない。"""
+
+    def generate(self, plan, campaign, profile):
+        hook = HOOK_TEMPLATES.get(plan["hook"], HOOK_TEMPLATES["statement"]).format(theme=plan["theme"])
+        audience = plan["target"] or profile.get("audience") or "読者"
+        body = STRUCTURE_BODIES.get(plan["structure"], STRUCTURE_BODIES["narrative"]).format(audience=audience)
+        cta = CTA_TEMPLATES.get(plan["cta"], CTA_TEMPLATES["none"])
+        return (
+            "【PR】\n" + hook + "\n" + body + "\n" + cta + "\n"
+            + campaign["name"] + "のご案内。\n内容・条件はリンク先でご確認ください。\n" + campaign["affiliate_url"]
+        )
+
+
+DEFAULT_DRAFT_GENERATOR = RuleBasedDraftGenerator()
+
+
 class Store:
     def __init__(self, db_path, mode="mock"):
         if mode not in {"mock", "live"}:
@@ -344,6 +441,8 @@ class Store:
         self.mode = mode
         self.provider = MockSourceProvider() if mode == "mock" else None
         self.analyzer = DEFAULT_ANALYZER
+        self.matcher = DEFAULT_MATCHER
+        self.draft_generator = DEFAULT_DRAFT_GENERATOR
         self.db_path = str(db_path)
         self._anchor = None
         self._uri = self.db_path == ":memory:"
@@ -399,13 +498,22 @@ class Store:
                 CREATE TABLE IF NOT EXISTS campaigns (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, network TEXT NOT NULL,
                     url TEXT NOT NULL, affiliate_url TEXT NOT NULL, category TEXT NOT NULL,
+                    target TEXT NOT NULL DEFAULT '', appeal_points TEXT NOT NULL DEFAULT '',
+                    reward_conditions TEXT NOT NULL DEFAULT '', prohibited_expressions TEXT NOT NULL DEFAULT '[]',
                     reward_yen INTEGER NOT NULL CHECK(reward_yen>=0),
                     status TEXT NOT NULL CHECK(status IN ('candidate','applied','approved','rejected','paused')),
                     notes TEXT NOT NULL, updated_at TEXT NOT NULL, is_mock INTEGER NOT NULL CHECK(is_mock IN (0,1))
                 );
+                CREATE TABLE IF NOT EXISTS plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
+                    source_id INTEGER REFERENCES sources(id), target TEXT NOT NULL, theme TEXT NOT NULL,
+                    hook TEXT NOT NULL, structure TEXT NOT NULL, appeal TEXT NOT NULL, cta TEXT NOT NULL,
+                    match_score INTEGER, created_at TEXT NOT NULL, is_mock INTEGER NOT NULL CHECK(is_mock IN (0,1))
+                );
                 CREATE TABLE IF NOT EXISTS drafts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, text TEXT NOT NULL,
                     campaign_id INTEGER REFERENCES campaigns(id), source_id INTEGER REFERENCES sources(id),
+                    plan_id INTEGER REFERENCES plans(id),
                     status TEXT NOT NULL CHECK(status IN ('draft','review','approved','exported')),
                     checks TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     is_mock INTEGER NOT NULL CHECK(is_mock IN (0,1))
@@ -436,12 +544,12 @@ class Store:
             self._insert_sources(connection, MockSourceProvider().fetch({"keywords": [], "genre": "", "watched_accounts": []}))
             timestamp = now()
             campaign_id = connection.execute(
-                "INSERT INTO campaigns(name,network,url,affiliate_url,category,reward_yen,status,notes,updated_at,is_mock) VALUES(?,?,?,?,?,?,?,?,?,1)",
-                ("架空の整理ノート", "デモASP（架空）", "https://example.com/mock-product", "https://example.com/mock-affiliate", "情報整理", 500, "approved", "架空案件です。承認済みの画面を試すためのデモで、実際の申請・提携はありません。", timestamp),
+                "INSERT INTO campaigns(name,network,url,affiliate_url,category,target,appeal_points,reward_conditions,prohibited_expressions,reward_yen,status,notes,updated_at,is_mock) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                ("架空の整理ノート", "デモASP（架空）", "https://example.com/mock-product", "https://example.com/mock-affiliate", "情報整理", "情報を整理したい人", "初心者でも迷わない手順書、テンプレート付き", "初回購入時のみ成果として計上（架空条件）", json.dumps(["絶対に成功", "返金保証"], ensure_ascii=False), 500, "approved", "架空案件です。承認済みの画面を試すためのデモで、実際の申請・提携はありません。", timestamp),
             ).lastrowid
             connection.execute(
-                "INSERT INTO campaigns(name,network,url,affiliate_url,category,reward_yen,status,notes,updated_at,is_mock) VALUES(?,?,?,?,?,?,?,?,?,1)",
-                ("架空の学習ガイド", "サンプルASP（架空）", "https://example.com/mock-guide", "", "学習", 800, "candidate", "候補の比較・申請状況の管理を試すための架空案件です。", timestamp),
+                "INSERT INTO campaigns(name,network,url,affiliate_url,category,target,appeal_points,reward_conditions,prohibited_expressions,reward_yen,status,notes,updated_at,is_mock) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                ("架空の学習ガイド", "サンプルASP（架空）", "https://example.com/mock-guide", "", "学習", "資格取得を目指す社会人", "独学でも続けられる学習計画、進捗管理", "資料請求完了時点で成果（架空条件）", json.dumps(["必ず合格"], ensure_ascii=False), 800, "candidate", "候補の比較・申請状況の管理を試すための架空案件です。", timestamp),
             )
             source_id = connection.execute("SELECT id FROM sources ORDER BY id LIMIT 1").fetchone()[0]
             self._insert_draft(connection, "整理ノートの紹介（サンプル）", "【PR】\n架空の整理ノートのご案内。\n内容・条件はリンク先でご確認ください。\nhttps://example.com/mock-affiliate", campaign_id, source_id, True)
@@ -451,11 +559,23 @@ class Store:
     @staticmethod
     def _migrate(connection):
         # Adds columns introduced after the initial release without disturbing existing local databases.
-        columns = {row["name"] for row in connection.execute("PRAGMA table_info(sources)")}
-        if "posted_at" not in columns:
+        source_columns = {row["name"] for row in connection.execute("PRAGMA table_info(sources)")}
+        if "posted_at" not in source_columns:
             connection.execute("ALTER TABLE sources ADD COLUMN posted_at TEXT NOT NULL DEFAULT ''")
-        if "author_followers" not in columns:
+        if "author_followers" not in source_columns:
             connection.execute("ALTER TABLE sources ADD COLUMN author_followers INTEGER NOT NULL DEFAULT 0")
+        campaign_columns = {row["name"] for row in connection.execute("PRAGMA table_info(campaigns)")}
+        for column, ddl in (
+            ("target", "ALTER TABLE campaigns ADD COLUMN target TEXT NOT NULL DEFAULT ''"),
+            ("appeal_points", "ALTER TABLE campaigns ADD COLUMN appeal_points TEXT NOT NULL DEFAULT ''"),
+            ("reward_conditions", "ALTER TABLE campaigns ADD COLUMN reward_conditions TEXT NOT NULL DEFAULT ''"),
+            ("prohibited_expressions", "ALTER TABLE campaigns ADD COLUMN prohibited_expressions TEXT NOT NULL DEFAULT '[]'"),
+        ):
+            if column not in campaign_columns:
+                connection.execute(ddl)
+        draft_columns = {row["name"] for row in connection.execute("PRAGMA table_info(drafts)")}
+        if "plan_id" not in draft_columns:
+            connection.execute("ALTER TABLE drafts ADD COLUMN plan_id INTEGER")
 
     def _audit(self, connection, action, entity_type, entity_id):
         # Persist only controlled metadata: never a body, URL, key or user input.
@@ -479,6 +599,8 @@ class Store:
                 item["is_mock"] = bool(item["is_mock"])
             if "checks" in item:
                 item["checks"] = json.loads(item["checks"]) if item["checks"] else None
+            if "prohibited_expressions" in item:
+                item["prohibited_expressions"] = json.loads(item["prohibited_expressions"]) if item["prohibited_expressions"] else []
             result.append(item)
         return result
 
@@ -493,6 +615,7 @@ class Store:
         sources = self._rows(connection, "sources", "id DESC")
         campaigns = self._rows(connection, "campaigns", "id DESC")
         drafts = self._rows(connection, "drafts", "id DESC")
+        plans = self._rows(connection, "plans", "id DESC")
         metrics = self._rows(connection, "metrics", "recorded_at DESC, id DESC")
         audit = [dict(row) for row in connection.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 30")]
         collection_settings = self._collection_settings(connection)
@@ -505,7 +628,9 @@ class Store:
                 + source["reposts"] * BUZZ_SCORE_WEIGHTS["repost"]
                 + source["replies"] * BUZZ_SCORE_WEIGHTS["reply"]
             )
-            content = self.analyzer.analyze(source["text"], source["topic"], "")
+            # audience は /api/plans/generate と同じ profile["audience"] を渡す。ここを空文字にすると
+            # マッチ候補の表示スコアと、実際に企画作成時に保存されるスコアがずれてしまう。
+            content = self.analyzer.analyze(source["text"], source["topic"], profile["audience"])
             pattern, lesson = PATTERN_LABELS.get(content["structure"], PATTERN_LABELS["narrative"])
             analysis.append({
                 "source_id": source["id"],
@@ -517,6 +642,20 @@ class Store:
                 "theme": content["theme"], "target": content["target"], "appeals": content["appeals"], "length": content["length"],
             })
         analysis.sort(key=lambda item: (-item["buzz_score"], item["source_id"]))
+        analysis_by_source = {item["source_id"]: item for item in analysis}
+        matches = []
+        for campaign in campaigns:
+            if campaign["status"] != "approved":
+                continue
+            campaign_matches = []
+            for source in sources:
+                # analysis_by_source は直前に同じ sources を無条件で走査して作っているため、
+                # 全 source_id が必ずキーとして存在する（欠損分岐は不要）。
+                content = analysis_by_source[source["id"]]
+                result = self.matcher.match(campaign, content, profile)
+                campaign_matches.append({"campaign_id": campaign["id"], "source_id": source["id"], "score": result["score"], "reasons": result["reasons"]})
+            campaign_matches.sort(key=lambda m: (-m["score"], m["source_id"]))
+            matches.extend(campaign_matches[:5])
         totals = {key: sum(item[key] for item in metrics) for key in ("impressions", "clicks", "conversions", "revenue_yen")}
         ctr = round(totals["clicks"] / totals["impressions"] * 100, 2) if totals["impressions"] else None
         cvr = round(totals["conversions"] / totals["clicks"] * 100, 2) if totals["clicks"] else None
@@ -531,7 +670,7 @@ class Store:
         else:
             recommendation = "同じ集計期間で投稿を比較し、導入や構成を一つずつ変更して確認しましょう。少数の成果から因果関係は断定できません。"
         summary = dict(totals, sources=len(sources), campaigns=len(campaigns), review=sum(item["status"] == "review" for item in drafts), approved=sum(item["status"] in {"approved", "exported"} for item in drafts), ctr=ctr, cvr=cvr, recommendation=recommendation)
-        return {"profile": profile, "sources": sources, "campaigns": campaigns, "drafts": drafts, "metrics": metrics, "analysis": analysis, "summary": summary, "audit": audit, "collection_settings": collection_settings}
+        return {"profile": profile, "sources": sources, "campaigns": campaigns, "drafts": drafts, "plans": plans, "matches": matches, "metrics": metrics, "analysis": analysis, "summary": summary, "audit": audit, "collection_settings": collection_settings}
 
     def _collection_settings(self, connection):
         row = dict(connection.execute("SELECT * FROM collection_settings WHERE id=1").fetchone())
@@ -572,11 +711,11 @@ class Store:
         else:
             connection.execute("UPDATE drafts SET status='draft',checks=NULL,updated_at=? WHERE campaign_id=?", (now(), campaign_id))
 
-    def _insert_draft(self, connection, title, text, campaign_id, source_id, is_mock):
+    def _insert_draft(self, connection, title, text, campaign_id, source_id, is_mock, plan_id=None):
         timestamp = now()
         return connection.execute(
-            "INSERT INTO drafts(title,text,campaign_id,source_id,status,checks,created_at,updated_at,is_mock) VALUES(?,?,?,?,'draft',NULL,?,?,?)",
-            (title, text, campaign_id, source_id, timestamp, timestamp, int(bool(is_mock))),
+            "INSERT INTO drafts(title,text,campaign_id,source_id,plan_id,status,checks,created_at,updated_at,is_mock) VALUES(?,?,?,?,?,'draft',NULL,?,?,?)",
+            (title, text, campaign_id, source_id, plan_id, timestamp, timestamp, int(bool(is_mock))),
         ).lastrowid
 
     def _checks(self, connection, draft):
@@ -603,6 +742,10 @@ class Store:
             expected = campaign["affiliate_url"]
             if not expected or not any(url == expected or url.rstrip("。！？、.,!;") == expected for url in urls):
                 issue("affiliate_url_missing", "error", "案件に登録した正確なアフィリエイト URL が本文にありません。")
+            prohibited = json.loads(campaign["prohibited_expressions"]) if campaign["prohibited_expressions"] else []
+            hit = next((word for word in prohibited if word and word in text), None)
+            if hit:
+                issue("prohibited_expression", "error", "案件で禁止されている表現が含まれています: " + hit)
         elif PROMOTION_RE.search(text):
             issue("unassigned_promotion", "error", "広告表現や URL を含む投稿は、承認済みの案件を紐付けて内容・リンクを確認してください。")
         if GUARANTEE_RE.search(text):
@@ -669,7 +812,7 @@ class Store:
             self._invalidate(connection)
             self._audit(connection, "save_profile_invalidate_drafts", "profile", 1)
         elif path == "/api/campaigns":
-            _keys(payload, {"id", "name", "network", "url", "affiliate_url", "category", "reward_yen", "status", "notes"})
+            _keys(payload, {"id", "name", "network", "url", "affiliate_url", "category", "target", "appeal_points", "reward_conditions", "prohibited_expressions", "reward_yen", "status", "notes"})
             record_id = _id(payload, required=False)
             if record_id is not None:
                 self._record(connection, "campaigns", record_id)
@@ -678,6 +821,10 @@ class Store:
             url = _url(_text(payload, "url", 2048), "url")
             affiliate_url = _url(_text(payload, "affiliate_url", 2048), "affiliate_url")
             category = _text(payload, "category", 100)
+            target = _text(payload, "target", 200)
+            appeal_points = _text(payload, "appeal_points", 500)
+            reward_conditions = _text(payload, "reward_conditions", 500)
+            prohibited_expressions = _string_list(payload, "prohibited_expressions", 20, 100)
             reward_yen = _integer(payload, "reward_yen")
             status = _text(payload, "status", 20, allow_empty=False)
             notes = _text(payload, "notes", 3000)
@@ -685,12 +832,12 @@ class Store:
                 raise AppError("案件のステータスが正しくありません。")
             if status == "approved" and not affiliate_url:
                 raise AppError("提携承認済みにするには、発行されたアフィリエイト URL を登録してください。")
-            values = (name, network, url, affiliate_url, category, reward_yen, status, notes, now())
+            values = (name, network, url, affiliate_url, category, target, appeal_points, reward_conditions, json.dumps(prohibited_expressions, ensure_ascii=False), reward_yen, status, notes, now())
             if record_id is None:
-                record_id = connection.execute("INSERT INTO campaigns(name,network,url,affiliate_url,category,reward_yen,status,notes,updated_at,is_mock) VALUES(?,?,?,?,?,?,?,?,?,0)", values).lastrowid
+                record_id = connection.execute("INSERT INTO campaigns(name,network,url,affiliate_url,category,target,appeal_points,reward_conditions,prohibited_expressions,reward_yen,status,notes,updated_at,is_mock) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0)", values).lastrowid
                 action = "add_campaign"
             else:
-                connection.execute("UPDATE campaigns SET name=?,network=?,url=?,affiliate_url=?,category=?,reward_yen=?,status=?,notes=?,updated_at=? WHERE id=?", values + (record_id,))
+                connection.execute("UPDATE campaigns SET name=?,network=?,url=?,affiliate_url=?,category=?,target=?,appeal_points=?,reward_conditions=?,prohibited_expressions=?,reward_yen=?,status=?,notes=?,updated_at=? WHERE id=?", values + (record_id,))
                 self._invalidate(connection, record_id)
                 action = "save_campaign_invalidate_drafts"
             self._audit(connection, action, "campaign", record_id)
@@ -720,6 +867,47 @@ class Store:
             is_mock = bool((campaign and campaign["is_mock"]) or (source and source["is_mock"]))
             record_id = self._insert_draft(connection, title[:160], text, campaign_id, source_id, is_mock)
             self._audit(connection, "generate_template", "draft", record_id)
+        elif path == "/api/plans/generate":
+            _keys(payload, {"campaign_id", "source_id", "angle"})
+            campaign_id = _id(payload, "campaign_id")
+            source_id = _id(payload, "source_id", required=False, nullable=True)
+            campaign = self._record(connection, "campaigns", campaign_id)
+            if campaign["status"] != "approved":
+                raise AppError("投稿企画の作成には、提携承認済みの案件を選んでください。", 409)
+            source = self._record(connection, "sources", source_id) if source_id is not None else None
+            angle = _text(payload, "angle", 160, required=False)
+            profile = dict(connection.execute("SELECT * FROM profile WHERE id=1").fetchone())
+            if source:
+                content = self.analyzer.analyze(source["text"], source["topic"], profile["audience"])
+                match_score = self.matcher.match(campaign, content, profile)["score"]
+            else:
+                # 参考にする投稿がない場合は、案件の訴求ポイント自体を分析してフック/構成/CTAの型を推定する。
+                content = self.analyzer.analyze(campaign["appeal_points"], campaign["category"], profile["audience"])
+                match_score = None
+            theme = angle or (source["topic"] if source else "") or campaign["category"] or profile["niche"] or "情報の確認"
+            target = campaign["target"] or content["target"]
+            appeal = ",".join(content["appeals"])
+            is_mock = bool(campaign["is_mock"]) or bool(source and source["is_mock"])
+            timestamp = now()
+            record_id = connection.execute(
+                "INSERT INTO plans(campaign_id,source_id,target,theme,hook,structure,appeal,cta,match_score,created_at,is_mock) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (campaign_id, source_id, target, theme, content["hook"], content["structure"], appeal, content["cta"], match_score, timestamp, int(is_mock)),
+            ).lastrowid
+            self._audit(connection, "generate_plan", "plan", record_id)
+        elif path == "/api/drafts/generate-from-plan":
+            _keys(payload, {"plan_id"})
+            plan_id = _id(payload, "plan_id")
+            plan = self._record(connection, "plans", plan_id)
+            campaign = self._record(connection, "campaigns", plan["campaign_id"])
+            if campaign["status"] != "approved":
+                raise AppError("案件が提携承認済みではなくなりました。案件の状態を確認してください。", 409)
+            source = self._record(connection, "sources", plan["source_id"]) if plan["source_id"] is not None else None
+            profile = dict(connection.execute("SELECT * FROM profile WHERE id=1").fetchone())
+            text = self.draft_generator.generate(plan, campaign, profile)
+            title = (plan["theme"] + "の投稿案（" + campaign["name"] + "）")[:160]
+            is_mock = bool(plan["is_mock"]) or bool(campaign["is_mock"]) or bool(source and source["is_mock"])
+            record_id = self._insert_draft(connection, title, text, plan["campaign_id"], plan["source_id"], is_mock, plan_id=plan_id)
+            self._audit(connection, "generate_draft_from_plan", "draft", record_id)
         elif path == "/api/drafts/save":
             _keys(payload, {"id", "title", "text", "campaign_id", "source_id"})
             record_id = _id(payload, required=False)
@@ -730,7 +918,9 @@ class Store:
             # Keep sample provenance even if a user later removes its links.
             is_mock = bool((old and old["is_mock"]) or (campaign and campaign["is_mock"]) or (source and source["is_mock"]))
             if old:
-                connection.execute("UPDATE drafts SET title=?,text=?,campaign_id=?,source_id=?,status='draft',checks=NULL,updated_at=?,is_mock=? WHERE id=?", (title, text, campaign_id, source_id, now(), int(is_mock), record_id))
+                # 案件・参考投稿を変更した場合は、以前の投稿企画とのつながりを外す（企画側は別の案件/参考投稿のまま）。
+                plan_id = old["plan_id"] if (old["campaign_id"] == campaign_id and old["source_id"] == source_id) else None
+                connection.execute("UPDATE drafts SET title=?,text=?,campaign_id=?,source_id=?,plan_id=?,status='draft',checks=NULL,updated_at=?,is_mock=? WHERE id=?", (title, text, campaign_id, source_id, plan_id, now(), int(is_mock), record_id))
             else:
                 record_id = self._insert_draft(connection, title, text, campaign_id, source_id, is_mock)
             self._audit(connection, "save_draft", "draft", record_id)
