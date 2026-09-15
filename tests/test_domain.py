@@ -2,6 +2,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from app.domain import (
     AppError,
@@ -11,6 +12,7 @@ from app.domain import (
     RuleBasedDraftGenerator,
     RuleBasedMatcher,
     Store,
+    WebIntentPublishProvider,
     buzz_score,
 )
 
@@ -86,6 +88,49 @@ class WorkflowTest(unittest.TestCase):
         with self.assertRaises(AppError) as error:
             self.store.mutate("/api/posts/publish", {"draft_id": draft["id"], "url": "https://x.com/myaccount/status/1", "posted_at": "2026-09-15T09:00:00Z"})
         self.assertEqual(409, error.exception.status)
+
+    def test_publish_intent_url_only_present_for_approved_or_exported_drafts(self):
+        state = self.store.state()
+        draft = state["drafts"][0]
+        self.assertIsNone(draft["publish_intent_url"])  # still status='draft': no "Xで投稿" affordance
+
+        campaign = self.approved_campaign()
+        state = self.store.mutate("/api/drafts/save", {
+            "title": "禁止表現で失敗する下書き", "text": "購入はこちら https://example.com/wrong",
+            "campaign_id": campaign["id"], "source_id": None,
+        })
+        bad_draft = state["drafts"][0]
+        self.store.mutate("/api/drafts/check", {"id": bad_draft["id"]})
+        state = self.store.state()
+        failed = next(d for d in state["drafts"] if d["id"] == bad_draft["id"])
+        self.assertEqual("review", failed["status"])  # checked but failing, never approved
+        self.assertIsNone(failed["publish_intent_url"])  # preflight NG: still no intent URL
+
+        approved = self._approve(draft["id"])
+        approved_draft = next(d for d in approved["drafts"] if d["id"] == draft["id"])
+        self.assertIsNotNone(approved_draft["publish_intent_url"])
+        self.assertTrue(approved_draft["publish_intent_url"].startswith("https://x.com/intent/tweet?text="))
+
+    def test_opening_web_intent_alone_does_not_publish(self):
+        # There is no API call behind the "Xで投稿" link (it's a plain <a href> the browser opens),
+        # so simply having an intent URL available must never create a posts row on its own.
+        draft = self.store.state()["drafts"][0]
+        state = self._approve(draft["id"])
+        approved_draft = next(d for d in state["drafts"] if d["id"] == draft["id"])
+        self.assertIsNotNone(approved_draft["publish_intent_url"])
+        self.assertEqual([], self.store.state()["posts"])
+        self.assertIn(draft["id"], self.store.state()["tasks"]["drafts_pending_publish"])
+
+    def test_double_publish_upserts_instead_of_duplicating(self):
+        draft = self.store.state()["drafts"][0]
+        self._approve(draft["id"])
+        first = self._publish(draft["id"], url="https://x.com/myaccount/status/111")
+        second = self._publish(draft["id"], url="https://x.com/myaccount/status/222")
+        self.assertEqual(first["id"], second["id"])
+        state = self.store.state()
+        matching = [p for p in state["posts"] if p["draft_id"] == draft["id"]]
+        self.assertEqual(1, len(matching))
+        self.assertEqual("https://x.com/myaccount/status/222", matching[0]["url"])
 
     def test_publish_rejects_invalid_x_url(self):
         draft = self.store.state()["drafts"][0]
@@ -426,6 +471,16 @@ class WorkflowTest(unittest.TestCase):
 
 
 class PureFunctionTest(unittest.TestCase):
+    def test_web_intent_url_uses_official_endpoint_and_round_trips_japanese_newlines_symbols(self):
+        provider = WebIntentPublishProvider()
+        text = "【PR】これは投稿文です。\n改行・記号（！？＆%#）・絵文字🎉も含みます。\nhttps://example.com/mock-affiliate"
+        url = provider.build_intent_url(text)
+        parsed = urlsplit(url)
+        self.assertEqual("https", parsed.scheme)
+        self.assertEqual("x.com", parsed.netloc)
+        self.assertEqual("/intent/tweet", parsed.path)
+        self.assertEqual(text, parse_qs(parsed.query)["text"][0])  # encode/decode round-trip is lossless
+
     def test_buzz_score_rewards_reach_relative_to_followers(self):
         small_account = buzz_score(likes=50, reposts=10, replies=5, impressions=5000, followers=1000)
         large_account = buzz_score(likes=50, reposts=10, replies=5, impressions=5000, followers=100000)

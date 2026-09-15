@@ -11,7 +11,7 @@ import re
 import sqlite3
 import uuid
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 
 class AppError(Exception):
@@ -484,6 +484,36 @@ class RuleBasedDraftGenerator(DraftGenerator):
 DEFAULT_DRAFT_GENERATOR = RuleBasedDraftGenerator()
 
 
+# --- 投稿連携: 将来 公式X API へ差し替え可能な構造 ----------------------------
+class PublishProvider:
+    """将来、有料の公式X APIなどに差し替えるための共通インターフェース。
+
+    このMVPでは実装しない: 認証情報の保存、Xへの直接投稿、投稿完了の自動検知は
+    すべて対象外。既定実装(WebIntentPublishProvider)はURL文字列を組み立てるだけで、
+    ネットワーク通信もCookie/トークンの取得・保存も一切行わない。
+    """
+
+    def build_intent_url(self, text):
+        raise NotImplementedError
+
+
+class WebIntentPublishProvider(PublishProvider):
+    """X公式の Web Intent (https://x.com/intent/tweet) でURLを組み立てるだけの既定実装。
+
+    投稿の実行・完了確認は行わない。ユーザーが開いた投稿作成画面で、本文を確認したうえで
+    「ポストする」を押す最後の操作を必ず人が行う。
+    """
+
+    INTENT_URL = "https://x.com/intent/tweet"
+
+    def build_intent_url(self, text):
+        # urlencode (urllib標準) を使い、文字列連結でURLを組み立てない。
+        return self.INTENT_URL + "?" + urlencode({"text": text})
+
+
+DEFAULT_PUBLISH_PROVIDER = WebIntentPublishProvider()
+
+
 class Store:
     def __init__(self, db_path, mode="mock"):
         if mode not in {"mock", "live"}:
@@ -493,6 +523,7 @@ class Store:
         self.analyzer = DEFAULT_ANALYZER
         self.matcher = DEFAULT_MATCHER
         self.draft_generator = DEFAULT_DRAFT_GENERATOR
+        self.publish_provider = DEFAULT_PUBLISH_PROVIDER
         self.db_path = str(db_path)
         self._anchor = None
         self._uri = self.db_path == ":memory:"
@@ -693,6 +724,10 @@ class Store:
         sources = self._rows(connection, "sources", "id DESC")
         campaigns = self._rows(connection, "campaigns", "id DESC")
         drafts = self._rows(connection, "drafts", "id DESC")
+        # 承認済み(検品合格)の下書きだけ Web Intent URL を持たせる。ここで弾くことで、
+        # 投稿ボタンが未承認/検品NGの下書きを迂回する経路になることを防ぐ。
+        for draft in drafts:
+            draft["publish_intent_url"] = self.publish_provider.build_intent_url(draft["text"]) if draft["status"] in {"approved", "exported"} else None
         plans = self._rows(connection, "plans", "id DESC")
         posts = self._rows(connection, "posts", "id DESC")
         metrics = self._rows(connection, "metrics", "recorded_at DESC, id DESC")
