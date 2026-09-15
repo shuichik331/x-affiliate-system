@@ -123,6 +123,36 @@ def _url(value, key, source=False):
     return value
 
 
+ISO_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?Z$")
+
+
+def _iso_datetime(payload, key, required=True):
+    value = _text(payload, key, 40, required=required, allow_empty=not required)
+    if not value:
+        return ""
+    if not ISO_DATETIME_RE.match(value):
+        raise AppError(key + " は ISO 8601 UTC 形式（例: 2026-09-15T10:00:00Z）で入力してください。")
+    return value
+
+
+def _string_list(payload, key, max_items, max_len):
+    if key not in payload:
+        raise AppError("必須項目が不足しています: " + key)
+    value = payload[key]
+    if not isinstance(value, list) or len(value) > max_items:
+        raise AppError(key + " は " + str(max_items) + " 件以内のリストで指定してください。")
+    result = []
+    for item in value:
+        if not isinstance(item, str):
+            raise AppError(key + " の各項目は文字列で入力してください。")
+        item = item.strip()
+        if len(item) > max_len:
+            raise AppError(key + " の各項目が長すぎます（上限 " + str(max_len) + " 文字）。")
+        if item:
+            result.append(item)
+    return result
+
+
 def _unit_weight(text):
     total = 0
     for char in text:
@@ -147,11 +177,157 @@ def weighted_length(text):
 
 
 MOCK_SOURCES = [
-    {"key": "research-checklist", "text": "【架空サンプル】情報を集めるときの3項目：出典、更新日、利用条件。投稿構成を比較するためのデモです。", "url": "https://example.com/mock-posts/research-checklist", "author": "架空の情報整理アカウント", "likes": 180, "reposts": 42, "replies": 18, "impressions": 6000, "topic": "情報整理"},
-    {"key": "question", "text": "【架空サンプル】新しいツールを選ぶとき、最初に何を確認しますか？ 読者への問いかけを含むデモ投稿です。", "url": "https://example.com/mock-posts/question", "author": "架空のツール研究室", "likes": 90, "reposts": 12, "replies": 36, "impressions": 4000, "topic": "ツール選び"},
-    {"key": "comparison", "text": "【架空サンプル】選択肢を比較する観点：費用、対象者、利用条件。数字はすべて検証用の架空値です。", "url": "https://example.com/mock-posts/comparison", "author": "架空の比較ノート", "likes": 260, "reposts": 80, "replies": 20, "impressions": 12000, "topic": "比較"},
-    {"key": "planning", "text": "【架空サンプル】投稿前に、誰に向けて何を伝えるかを一文に整理する。短い導入の構成を試すデモです。", "url": "https://example.com/mock-posts/planning", "author": "架空の投稿編集室", "likes": 64, "reposts": 14, "replies": 6, "impressions": 3000, "topic": "投稿企画"},
+    {"key": "research-checklist", "text": "【架空サンプル】情報を集めるときの3項目：出典、更新日、利用条件。投稿構成を比較するためのデモです。", "url": "https://example.com/mock-posts/research-checklist", "author": "架空の情報整理アカウント", "likes": 180, "reposts": 42, "replies": 18, "impressions": 6000, "topic": "情報整理", "followers": 8200, "posted_hours_ago": 6},
+    {"key": "question", "text": "【架空サンプル】新しいツールを選ぶとき、最初に何を確認しますか？ 読者への問いかけを含むデモ投稿です。", "url": "https://example.com/mock-posts/question", "author": "架空のツール研究室", "likes": 90, "reposts": 12, "replies": 36, "impressions": 4000, "topic": "ツール選び", "followers": 3100, "posted_hours_ago": 30},
+    {"key": "comparison", "text": "【架空サンプル】選択肢を比較する観点：費用、対象者、利用条件。数字はすべて検証用の架空値です。", "url": "https://example.com/mock-posts/comparison", "author": "架空の比較ノート", "likes": 260, "reposts": 80, "replies": 20, "impressions": 12000, "topic": "比較", "followers": 15400, "posted_hours_ago": 50},
+    {"key": "planning", "text": "【架空サンプル】投稿前に、誰に向けて何を伝えるかを一文に整理する。短い導入の構成を試すデモです。", "url": "https://example.com/mock-posts/planning", "author": "架空の投稿編集室", "likes": 64, "reposts": 14, "replies": 6, "impressions": 3000, "topic": "投稿企画", "followers": 2400, "posted_hours_ago": 12},
 ]
+
+
+# --- バズスコア: フォロワー数に対する伸びの目安 -----------------------------
+# 重みはここだけを見れば調整できるように定数へ切り出している。
+BUZZ_SCORE_WEIGHTS = {"like": 1.0, "repost": 2.0, "reply": 1.5}
+
+
+def buzz_score(likes, reposts, replies, impressions, followers):
+    """フォロワー数に対する反応の大きさを表す参考スコア（絶対値の反応数だけでは大アカウントが常に上位になるため）。
+
+    reach_multiplier: 表示回数がフォロワー数の何倍に達したか（フォロワー外への拡散の目安）
+    engagement_rate:   重み付き反応 ÷ 表示回数（反応の質の目安）
+    score = reach_multiplier × (1 + engagement_rate)
+    """
+    followers_safe = max(followers, 1)
+    impressions_safe = max(impressions, 0)
+    weighted_engagement = (
+        likes * BUZZ_SCORE_WEIGHTS["like"]
+        + reposts * BUZZ_SCORE_WEIGHTS["repost"]
+        + replies * BUZZ_SCORE_WEIGHTS["reply"]
+    )
+    reach_multiplier = impressions_safe / followers_safe
+    engagement_rate = (weighted_engagement / impressions_safe) if impressions_safe else 0.0
+    return round(reach_multiplier * (1 + engagement_rate), 2)
+
+
+# --- 投稿内容の分析: ルールベース（将来 LLM 実装へ差し替え可能な構造） -------
+HOOK_PATTERNS = (
+    ("question", re.compile(r"[?？]")),
+    ("number", re.compile(r"[0-9０-９]+\s*(?:つ|個|選|ステップ|項目)")),
+    ("warning", re.compile(r"(?:注意|危険|やってはいけない|NG|失敗)")),
+    ("claim", re.compile(r"(?:結論|断言|実は|答えは)")),
+)
+STRUCTURE_PATTERNS = (
+    ("question", re.compile(r"[?？]")),
+    ("list", re.compile(r"(?:項目|観点|：|1\.|①|・)")),
+)
+CTA_PATTERNS = (
+    ("follow", re.compile(r"フォロー")),
+    ("reply", re.compile(r"(?:リプ|コメント)(?:で|欄)")),
+    ("save", re.compile(r"保存")),
+    ("link", re.compile(r"https?://")),
+)
+APPEAL_PATTERNS = {
+    "number": re.compile(r"[0-9０-９]+\s*(?:つ|個|%|％|万|円)"),
+    "authority": re.compile(r"(?:年収|経歴|資格|専門家|プロ)"),
+    "empathy": re.compile(r"(?:わかる|あるある|私も|共感)"),
+    "urgency": re.compile(r"(?:今すぐ|今だけ|残り|締切|損する)"),
+    "curiosity": re.compile(r"(?:知らないと|実は|意外)"),
+}
+
+
+def _classify(text, patterns, default):
+    for name, pattern in patterns:
+        if pattern.search(text):
+            return name
+    return default
+
+
+class ContentAnalyzer:
+    """将来 LLM ベースの分析に差し替えるための共通インターフェース。"""
+
+    def analyze(self, text, topic="", audience=""):
+        raise NotImplementedError
+
+
+class RuleBasedAnalyzer(ContentAnalyzer):
+    """正規表現によるルールベース分析。初期版の既定実装。"""
+
+    def analyze(self, text, topic="", audience=""):
+        head = text.strip().splitlines()[0] if text.strip() else ""
+        hook = _classify(head, HOOK_PATTERNS, "statement")
+        structure = _classify(text, STRUCTURE_PATTERNS, "narrative")
+        cta = _classify(text, CTA_PATTERNS, "none")
+        appeals = [name for name, pattern in APPEAL_PATTERNS.items() if pattern.search(text)]
+        target = audience.strip() or ((topic + "に関心がある人") if topic else "未設定")
+        return {
+            "hook": hook,
+            "structure": structure,
+            "cta": cta,
+            "theme": topic or "未分類",
+            "target": target,
+            "appeals": appeals,
+            "length": weighted_length(text),
+        }
+
+
+DEFAULT_ANALYZER = RuleBasedAnalyzer()
+
+# 投稿案生成で使うテンプレート。参考にするのは分類ラベルのみで、原文は一切使わない。
+HOOK_TEMPLATES = {
+    "question": "{theme}について、こう感じたことはありませんか？",
+    "number": "{theme}を整理する3つの視点。",
+    "warning": "{theme}で見落としがちな注意点があります。",
+    "claim": "{theme}について、先に要点を書きます。",
+    "statement": "{theme}について、今日は要点を整理します。",
+}
+STRUCTURE_BODIES = {
+    "list": "{audience}向けに、押さえておきたい点を整理します。\n・出典と更新日を確認する\n・対象者と条件を確認する\n・自分の言葉で言い換える",
+    "question": "{audience}にとって何が一番気になるポイントか、一つずつ確認していきます。",
+    "narrative": "{audience}向けに、要点を一つに絞って深掘りします。",
+}
+CTA_TEMPLATES = {
+    "follow": "続きを見逃したくない方はフォローしてお待ちください。",
+    "reply": "気になる点があれば、リプライで教えてください。",
+    "save": "後で見返せるよう、保存しておくのがおすすめです。",
+    "link": "詳しい内容はリンク先で確認してください。",
+    "none": "参考になれば、気軽に反応してください。",
+}
+
+
+def build_reference_draft(profile, theme, analysis):
+    """バズ投稿の構成・フック・訴求パターン(分類ラベル)だけを参考に新規本文を組み立てる。原文は使用しない。"""
+    hook = HOOK_TEMPLATES.get(analysis["hook"], HOOK_TEMPLATES["statement"]).format(theme=theme)
+    audience = profile.get("audience") or "読者"
+    body = STRUCTURE_BODIES.get(analysis["structure"], STRUCTURE_BODIES["narrative"]).format(audience=audience)
+    cta = CTA_TEMPLATES.get(analysis["cta"], CTA_TEMPLATES["none"])
+    return hook + "\n" + body + "\n" + cta
+
+
+# --- 情報収集プロバイダー: 将来 X API へ差し替え可能な構造 -------------------
+class SourceProvider:
+    """情報収集の抽象化。実接続の可否は Store 側の mode で fail-closed に制御する。"""
+
+    def fetch(self, settings):
+        raise NotImplementedError
+
+
+class MockSourceProvider(SourceProvider):
+    """架空サンプルのみを返す。外部通信は一切行わない。"""
+
+    def fetch(self, settings):
+        keywords = settings.get("keywords") or []
+        genre = settings.get("genre") or ""
+        accounts = settings.get("watched_accounts") or []
+        results = []
+        for source in MOCK_SOURCES:
+            haystack = (source["text"] + " " + source["author"] + " " + source["topic"]).casefold()
+            if keywords and not any(k.casefold() in haystack for k in keywords):
+                continue
+            if genre and genre.casefold() != source["topic"].casefold():
+                continue
+            if accounts and not any(a.casefold() in source["author"].casefold() for a in accounts):
+                continue
+            results.append(source)
+        return results
 
 
 class Store:
@@ -159,6 +335,8 @@ class Store:
         if mode not in {"mock", "live"}:
             raise AppError("運転モードは mock または live を指定してください。")
         self.mode = mode
+        self.provider = MockSourceProvider() if mode == "mock" else None
+        self.analyzer = DEFAULT_ANALYZER
         self.db_path = str(db_path)
         self._anchor = None
         self._uri = self.db_path == ":memory:"
@@ -203,7 +381,13 @@ class Store:
                     url TEXT NOT NULL, author TEXT NOT NULL, likes INTEGER NOT NULL CHECK(likes>=0),
                     reposts INTEGER NOT NULL CHECK(reposts>=0), replies INTEGER NOT NULL CHECK(replies>=0),
                     impressions INTEGER NOT NULL CHECK(impressions>=0), topic TEXT NOT NULL,
+                    posted_at TEXT NOT NULL DEFAULT '', author_followers INTEGER NOT NULL DEFAULT 0,
                     collected_at TEXT NOT NULL, is_mock INTEGER NOT NULL CHECK(is_mock IN (0,1))
+                );
+                CREATE TABLE IF NOT EXISTS collection_settings (
+                    id INTEGER PRIMARY KEY CHECK(id=1), keywords TEXT NOT NULL,
+                    genre TEXT NOT NULL, watched_accounts TEXT NOT NULL,
+                    period_days INTEGER NOT NULL CHECK(period_days BETWEEN 1 AND 365)
                 );
                 CREATE TABLE IF NOT EXISTS campaigns (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, network TEXT NOT NULL,
@@ -230,14 +414,19 @@ class Store:
                     entity_id INTEGER, created_at TEXT NOT NULL
                 );
             """)
+            self._migrate(connection)
             connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("SELECT 1 FROM collection_settings WHERE id=1").fetchone() is None:
+                connection.execute(
+                    "INSERT INTO collection_settings(id,keywords,genre,watched_accounts,period_days) VALUES(1,'[]','','[]',7)"
+                )
             if connection.execute("SELECT value FROM meta WHERE key='initialized'").fetchone():
                 return
             connection.execute(
                 "INSERT INTO profile(id,name,bio,audience,niche,tone,pillars) VALUES(1,?,?,?,?,?,?)",
                 ("情報整理ノート（設定例）", "情報の出典と条件を確認して、わかりやすく整理します。", "情報を整理したい人", "情報整理", "落ち着いた、わかりやすい日本語", "出典の確認、選択肢の比較、振り返り"),
             )
-            self._collect(connection, "")
+            self._insert_sources(connection, MockSourceProvider().fetch({"keywords": [], "genre": "", "watched_accounts": []}))
             timestamp = now()
             campaign_id = connection.execute(
                 "INSERT INTO campaigns(name,network,url,affiliate_url,category,reward_yen,status,notes,updated_at,is_mock) VALUES(?,?,?,?,?,?,?,?,?,1)",
@@ -251,6 +440,15 @@ class Store:
             self._insert_draft(connection, "整理ノートの紹介（サンプル）", "【PR】\n架空の整理ノートのご案内。\n内容・条件はリンク先でご確認ください。\nhttps://example.com/mock-affiliate", campaign_id, source_id, True)
             connection.execute("INSERT INTO meta(key,value) VALUES('initialized','1')")
             self._audit(connection, "seed_demo", "system", None)
+
+    @staticmethod
+    def _migrate(connection):
+        # Adds columns introduced after the initial release without disturbing existing local databases.
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(sources)")}
+        if "posted_at" not in columns:
+            connection.execute("ALTER TABLE sources ADD COLUMN posted_at TEXT NOT NULL DEFAULT ''")
+        if "author_followers" not in columns:
+            connection.execute("ALTER TABLE sources ADD COLUMN author_followers INTEGER NOT NULL DEFAULT 0")
 
     def _audit(self, connection, action, entity_type, entity_id):
         # Persist only controlled metadata: never a body, URL, key or user input.
@@ -290,6 +488,7 @@ class Store:
         drafts = self._rows(connection, "drafts", "id DESC")
         metrics = self._rows(connection, "metrics", "recorded_at DESC, id DESC")
         audit = [dict(row) for row in connection.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 30")]
+        collection_settings = self._collection_settings(connection)
         analysis = []
         for source in sources:
             impressions = source["impressions"]
@@ -301,8 +500,17 @@ class Store:
                 pattern, lesson = "要点・比較", "要点を先に示す構成を検討。原文を転載せず、自分のテーマと根拠で作成してください。"
             else:
                 pattern, lesson = "短い導入", "一つのテーマに絞る構成を検討。表示数や投稿条件の違いも確認してください。"
-            analysis.append({"source_id": source["id"], "engagement_rate": round(interactions / impressions * 100, 2) if impressions else None, "score": round(weighted / impressions * 100, 2) if impressions else 0, "pattern": pattern, "lesson": lesson})
-        analysis.sort(key=lambda item: (-item["score"], item["source_id"]))
+            content = self.analyzer.analyze(source["text"], source["topic"], "")
+            analysis.append({
+                "source_id": source["id"],
+                "engagement_rate": round(interactions / impressions * 100, 2) if impressions else None,
+                "score": round(weighted / impressions * 100, 2) if impressions else 0,
+                "buzz_score": buzz_score(source["likes"], source["reposts"], source["replies"], impressions, source["author_followers"]),
+                "pattern": pattern, "lesson": lesson,
+                "hook": content["hook"], "structure": content["structure"], "cta": content["cta"],
+                "theme": content["theme"], "target": content["target"], "appeals": content["appeals"], "length": content["length"],
+            })
+        analysis.sort(key=lambda item: (-item["buzz_score"], item["source_id"]))
         totals = {key: sum(item[key] for item in metrics) for key in ("impressions", "clicks", "conversions", "revenue_yen")}
         ctr = round(totals["clicks"] / totals["impressions"] * 100, 2) if totals["impressions"] else None
         cvr = round(totals["conversions"] / totals["clicks"] * 100, 2) if totals["clicks"] else None
@@ -317,16 +525,32 @@ class Store:
         else:
             recommendation = "同じ集計期間で投稿を比較し、導入や構成を一つずつ変更して確認しましょう。少数の成果から因果関係は断定できません。"
         summary = dict(totals, sources=len(sources), campaigns=len(campaigns), review=sum(item["status"] == "review" for item in drafts), approved=sum(item["status"] in {"approved", "exported"} for item in drafts), ctr=ctr, cvr=cvr, recommendation=recommendation)
-        return {"profile": profile, "sources": sources, "campaigns": campaigns, "drafts": drafts, "metrics": metrics, "analysis": analysis, "summary": summary, "audit": audit}
+        return {"profile": profile, "sources": sources, "campaigns": campaigns, "drafts": drafts, "metrics": metrics, "analysis": analysis, "summary": summary, "audit": audit, "collection_settings": collection_settings}
 
-    def _collect(self, connection, query):
-        for source in MOCK_SOURCES:
-            if query and query.casefold() not in (source["text"] + " " + source["author"] + " " + source["topic"]).casefold():
-                continue
+    def _collection_settings(self, connection):
+        row = dict(connection.execute("SELECT * FROM collection_settings WHERE id=1").fetchone())
+        row.pop("id")
+        row["keywords"] = json.loads(row["keywords"])
+        row["watched_accounts"] = json.loads(row["watched_accounts"])
+        return row
+
+    @staticmethod
+    def _insert_sources(connection, rows):
+        timestamp = now()
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        for source in rows:
+            posted_at = (now_dt - datetime.timedelta(hours=source.get("posted_hours_ago", 0))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             connection.execute(
-                "INSERT OR IGNORE INTO sources(seed_key,text,url,author,likes,reposts,replies,impressions,topic,collected_at,is_mock) VALUES(?,?,?,?,?,?,?,?,?,?,1)",
-                (source["key"], source["text"], source["url"], source["author"], source["likes"], source["reposts"], source["replies"], source["impressions"], source["topic"], now()),
+                "INSERT OR IGNORE INTO sources(seed_key,text,url,author,likes,reposts,replies,impressions,author_followers,topic,posted_at,collected_at,is_mock) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                (source["key"], source["text"], source["url"], source["author"], source["likes"], source["reposts"], source["replies"], source["impressions"], source.get("followers", 0), source["topic"], posted_at, timestamp),
             )
+
+    def _collect(self, connection, settings):
+        # Demo seeding (Store.__init__) always uses fixture data regardless of mode; only this
+        # on-demand path (the /api/collect API) is fail-closed for a non-mock provider.
+        if self.provider is None:
+            raise AppError("実接続は未実装です。収集には mock モードを使用してください。", 503)
+        self._insert_sources(connection, self.provider.fetch(settings))
 
     def _links(self, connection, payload):
         campaign_id = _id(payload, "campaign_id", required=False, nullable=True)
@@ -400,20 +624,35 @@ class Store:
         if path == "/api/collect":
             _keys(payload, {"query"})
             query = _text(payload, "query", 200, required=False)
-            if self.mode != "mock":
-                raise AppError("実接続は未実装です。収集には mock モードを使用してください。", 503)
-            self._collect(connection, query)
+            settings = self._collection_settings(connection)
+            if query:
+                settings = dict(settings, keywords=settings["keywords"] + [query])
+            self._collect(connection, settings)
             self._audit(connection, "collect_mock", "source", None)
+        elif path == "/api/collection-settings":
+            _keys(payload, {"keywords", "genre", "watched_accounts", "period_days"})
+            keywords = _string_list(payload, "keywords", 10, 50)
+            genre = _text(payload, "genre", 50)
+            watched_accounts = _string_list(payload, "watched_accounts", 10, 50)
+            period_days = _integer(payload, "period_days")
+            if not 1 <= period_days <= 365:
+                raise AppError("収集対象期間は 1〜365 日で指定してください。")
+            connection.execute(
+                "UPDATE collection_settings SET keywords=?,genre=?,watched_accounts=?,period_days=? WHERE id=1",
+                (json.dumps(keywords, ensure_ascii=False), genre, json.dumps(watched_accounts, ensure_ascii=False), period_days),
+            )
+            self._audit(connection, "save_collection_settings", "collection_settings", 1)
         elif path == "/api/sources":
-            _keys(payload, {"text", "url", "author", "likes", "reposts", "replies", "impressions", "topic"})
+            _keys(payload, {"text", "url", "author", "likes", "reposts", "replies", "impressions", "topic", "posted_at", "followers"})
             text = _text(payload, "text", 5000, allow_empty=False)
             url = _url(_text(payload, "url", 2048, allow_empty=False), "url", source=True)
             author = _text(payload, "author", 100, allow_empty=False)
             topic = _text(payload, "topic", 100)
-            numbers = [_integer(payload, key) for key in ("likes", "reposts", "replies", "impressions")]
+            posted_at = _iso_datetime(payload, "posted_at")
+            numbers = [_integer(payload, key) for key in ("likes", "reposts", "replies", "impressions", "followers")]
             record_id = connection.execute(
-                "INSERT INTO sources(text,url,author,likes,reposts,replies,impressions,topic,collected_at,is_mock) VALUES(?,?,?,?,?,?,?,?,?,0)",
-                (text, url, author, numbers[0], numbers[1], numbers[2], numbers[3], topic, now()),
+                "INSERT INTO sources(text,url,author,likes,reposts,replies,impressions,author_followers,topic,posted_at,collected_at,is_mock) VALUES(?,?,?,?,?,?,?,?,?,?,?,0)",
+                (text, url, author, numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], topic, posted_at, now()),
             ).lastrowid
             self._audit(connection, "add_source", "source", record_id)
         elif path == "/api/profile":
@@ -457,13 +696,17 @@ class Store:
             angle = _text(payload, "angle", 160, required=False)
             profile = dict(connection.execute("SELECT * FROM profile WHERE id=1").fetchone())
             theme = angle or (source["topic"] if source else "") or profile["niche"] or "情報の確認"
+            # 参考にするのは分類ラベル（hook/structure/cta）だけで、原文の文字列は生成に使わない。
+            content = self.analyzer.analyze(source["text"], source["topic"], profile["audience"]) if source else None
             if campaign:
                 if campaign["status"] != "approved":
                     raise AppError("広告投稿の作成には、提携承認済みの案件を選んでください。", 409)
-                text = "【PR】\n" + campaign["name"] + "のご案内。\n内容・条件はリンク先でご確認ください。\n" + campaign["affiliate_url"]
-                if angle:
-                    text = "【PR】\nテーマ：" + angle + "\n" + text[len("【PR】\n"):]
+                hook = HOOK_TEMPLATES.get(content["hook"], HOOK_TEMPLATES["statement"]).format(theme=theme) if content else ""
+                text = "【PR】\n" + (hook + "\n" if hook else "") + campaign["name"] + "のご案内。\n内容・条件はリンク先でご確認ください。\n" + campaign["affiliate_url"]
                 title = campaign["name"] + "の紹介案"
+            elif source:
+                text = build_reference_draft(profile, theme, content)
+                title = (theme + "の投稿案（" + source["author"] + "の構成を参考）")[:160]
             else:
                 audience = profile["audience"] or "読者"
                 text = "今日のテーマ：" + theme + "\n" + audience + "向けに、情報の出典・更新日・条件を確認して整理します。\n気になる点を一つ選び、次の投稿で深掘りします。"
