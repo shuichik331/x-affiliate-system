@@ -1,0 +1,23 @@
+# Local settings and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+secrets*.json
+
+# User data and runtime files
+data/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+.coverage
+htmlcov/
+work/
