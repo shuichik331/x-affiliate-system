@@ -22,6 +22,7 @@ class AppError(Exception):
 
 
 CAMPAIGN_STATUSES = {"candidate", "applied", "approved", "rejected", "paused"}
+POST_STATUSES = {"published", "stopped", "removed"}
 MAX_NUMBER = 10 ** 12
 URL_RE = re.compile(r"https?://[^\s<>\"'【】「」『』（）]+", re.IGNORECASE)
 PROMOTION_RE = re.compile(
@@ -410,25 +411,74 @@ DEFAULT_MATCHER = RuleBasedMatcher()
 
 
 # --- 下書き生成: 将来 LLM Provider へ差し替え可能な構造 -----------------------
+# app/static/app.js の DRAFT_STYLES と対応。スタイルはランダムではなく、明確な型として定義する。
+DRAFT_STYLES = {
+    "conclusion_first": "結論先出し型",
+    "problem_raising": "問題提起型",
+    "comparison": "比較型",
+    "bullet_list": "箇条書き型",
+    "short_form": "短文型",
+}
+
+
 class DraftGenerator:
     """将来 LLM ベースの生成に差し替えるための共通インターフェース。"""
 
-    def generate(self, plan, campaign, profile):
+    def generate(self, plan, campaign, profile, style=None):
         raise NotImplementedError
 
 
 class RuleBasedDraftGenerator(DraftGenerator):
-    """投稿企画の分類ラベルからテンプレートで本文を組み立てる既定実装。原文は使用しない。"""
+    """投稿企画の分類ラベルからテンプレートで本文を組み立てる既定実装。原文は使用しない。
 
-    def generate(self, plan, campaign, profile):
-        hook = HOOK_TEMPLATES.get(plan["hook"], HOOK_TEMPLATES["statement"]).format(theme=plan["theme"])
-        audience = plan["target"] or profile.get("audience") or "読者"
-        body = STRUCTURE_BODIES.get(plan["structure"], STRUCTURE_BODIES["narrative"]).format(audience=audience)
+    style を省略すると企画の structure から妥当な型を自動選択する。PR表示・完全一致URLは
+    どのスタイルでも末尾に固定で付き、検品(_checks)の要件を満たす。
+    """
+
+    def generate(self, plan, campaign, profile, style=None):
+        style = style if style in DRAFT_STYLES else self._default_style(plan)
+        # Explicit dict (not getattr("_style_"+style)) so a key added to DRAFT_STYLES without a
+        # matching builder here fails at this line, not with an AttributeError deep in a request.
+        builders = {
+            "conclusion_first": self._style_conclusion_first,
+            "problem_raising": self._style_problem_raising,
+            "comparison": self._style_comparison,
+            "bullet_list": self._style_bullet_list,
+            "short_form": self._style_short_form,
+        }
+        body = builders[style](plan, profile)
         cta = CTA_TEMPLATES.get(plan["cta"], CTA_TEMPLATES["none"])
         return (
-            "【PR】\n" + hook + "\n" + body + "\n" + cta + "\n"
+            "【PR】\n" + body + "\n" + cta + "\n"
             + campaign["name"] + "のご案内。\n内容・条件はリンク先でご確認ください。\n" + campaign["affiliate_url"]
         )
+
+    @staticmethod
+    def _default_style(plan):
+        return {"question": "problem_raising", "list": "bullet_list"}.get(plan["structure"], "conclusion_first")
+
+    @staticmethod
+    def _style_conclusion_first(plan, profile):
+        audience = plan["target"] or profile.get("audience") or "読者"
+        return "結論：" + plan["theme"] + "は、" + audience + "が判断に迷いやすいテーマです。\n出典・条件・独自性を確認すると選びやすくなります。"
+
+    @staticmethod
+    def _style_problem_raising(plan, profile):
+        audience = plan["target"] or profile.get("audience") or "読者"
+        return plan["theme"] + "について、" + audience + "はこう感じたことはありませんか？\n「何を基準に選べばいいか分からない」"
+
+    @staticmethod
+    def _style_comparison(plan, profile):
+        return plan["theme"] + "を比較する観点：\n・費用\n・対象者\n・条件\n違いを確認してから選ぶと判断がぶれません。"
+
+    @staticmethod
+    def _style_bullet_list(plan, profile):
+        audience = plan["target"] or profile.get("audience") or "読者"
+        return audience + "向け、" + plan["theme"] + "のチェックリスト：\n・出典と更新日\n・対象者と条件\n・自分の言葉で言い換える"
+
+    @staticmethod
+    def _style_short_form(plan, profile):
+        return plan["theme"] + "。\n結論は一つ、事実確認から始めることです。"
 
 
 DEFAULT_DRAFT_GENERATOR = RuleBasedDraftGenerator()
@@ -476,6 +526,7 @@ class Store:
     def _initialize(self):
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
+            dropped_old_metrics = self._migrate_pre_create(connection)
             connection.executescript("""
                 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS profile (
@@ -518,11 +569,21 @@ class Store:
                     checks TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     is_mock INTEGER NOT NULL CHECK(is_mock IN (0,1))
                 );
-                CREATE TABLE IF NOT EXISTS metrics (
+                CREATE TABLE IF NOT EXISTS posts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER NOT NULL UNIQUE REFERENCES drafts(id),
-                    impressions INTEGER NOT NULL CHECK(impressions>=0), clicks INTEGER NOT NULL CHECK(clicks>=0),
-                    conversions INTEGER NOT NULL CHECK(conversions>=0), revenue_yen INTEGER NOT NULL CHECK(revenue_yen>=0),
-                    recorded_at TEXT NOT NULL, CHECK(conversions<=clicks AND clicks<=impressions)
+                    plan_id INTEGER REFERENCES plans(id), campaign_id INTEGER REFERENCES campaigns(id),
+                    source_id INTEGER REFERENCES sources(id), title TEXT NOT NULL, text TEXT NOT NULL,
+                    url TEXT NOT NULL, published_at TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('published','stopped','removed')),
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, is_mock INTEGER NOT NULL CHECK(is_mock IN (0,1))
+                );
+                CREATE TABLE IF NOT EXISTS metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER NOT NULL UNIQUE REFERENCES posts(id),
+                    impressions INTEGER NOT NULL CHECK(impressions>=0), likes INTEGER NOT NULL CHECK(likes>=0),
+                    reposts INTEGER NOT NULL CHECK(reposts>=0), replies INTEGER NOT NULL CHECK(replies>=0),
+                    link_clicks INTEGER NOT NULL CHECK(link_clicks>=0), conversions INTEGER NOT NULL CHECK(conversions>=0),
+                    revenue_yen INTEGER NOT NULL CHECK(revenue_yen>=0), recorded_at TEXT NOT NULL,
+                    CHECK(conversions<=link_clicks AND link_clicks<=impressions AND likes<=impressions AND reposts<=impressions AND replies<=impressions)
                 );
                 CREATE TABLE IF NOT EXISTS audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL, entity_type TEXT NOT NULL,
@@ -531,6 +592,9 @@ class Store:
             """)
             self._migrate(connection)
             connection.execute("BEGIN IMMEDIATE")
+            if dropped_old_metrics:
+                # Record the destructive migration itself, same as any other mutation, so it isn't silent.
+                self._audit(connection, "migrate_drop_old_metrics", "system", None)
             if connection.execute("SELECT 1 FROM collection_settings WHERE id=1").fetchone() is None:
                 connection.execute(
                     "INSERT INTO collection_settings(id,keywords,genre,watched_accounts,period_days) VALUES(1,'[]','','[]',7)"
@@ -555,6 +619,20 @@ class Store:
             self._insert_draft(connection, "整理ノートの紹介（サンプル）", "【PR】\n架空の整理ノートのご案内。\n内容・条件はリンク先でご確認ください。\nhttps://example.com/mock-affiliate", campaign_id, source_id, True)
             connection.execute("INSERT INTO meta(key,value) VALUES('initialized','1')")
             self._audit(connection, "seed_demo", "system", None)
+
+    @staticmethod
+    def _migrate_pre_create(connection):
+        # metrics changed from draft-linked to published-post-linked (the "posts" table did not
+        # exist before). Old rows can't be mapped onto a post that never existed, so instead of a
+        # lossy ALTER we rebuild the table; this only affects databases from before this feature.
+        # Returns whether the drop happened, so the caller can leave an audit trail for it.
+        tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "metrics" in tables:
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(metrics)")}
+            if "draft_id" in columns:
+                connection.execute("DROP TABLE metrics")
+                return True
+        return False
 
     @staticmethod
     def _migrate(connection):
@@ -616,6 +694,7 @@ class Store:
         campaigns = self._rows(connection, "campaigns", "id DESC")
         drafts = self._rows(connection, "drafts", "id DESC")
         plans = self._rows(connection, "plans", "id DESC")
+        posts = self._rows(connection, "posts", "id DESC")
         metrics = self._rows(connection, "metrics", "recorded_at DESC, id DESC")
         audit = [dict(row) for row in connection.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 30")]
         collection_settings = self._collection_settings(connection)
@@ -656,21 +735,95 @@ class Store:
                 campaign_matches.append({"campaign_id": campaign["id"], "source_id": source["id"], "score": result["score"], "reasons": result["reasons"]})
             campaign_matches.sort(key=lambda m: (-m["score"], m["source_id"]))
             matches.extend(campaign_matches[:5])
-        totals = {key: sum(item[key] for item in metrics) for key in ("impressions", "clicks", "conversions", "revenue_yen")}
-        ctr = round(totals["clicks"] / totals["impressions"] * 100, 2) if totals["impressions"] else None
-        cvr = round(totals["conversions"] / totals["clicks"] * 100, 2) if totals["clicks"] else None
+        totals = {key: sum(item[key] for item in metrics) for key in ("impressions", "likes", "reposts", "replies", "link_clicks", "conversions", "revenue_yen")}
+        ctr = round(totals["link_clicks"] / totals["impressions"] * 100, 2) if totals["impressions"] else None
+        cvr = round(totals["conversions"] / totals["link_clicks"] * 100, 2) if totals["link_clicks"] else None
+        epc = round(totals["revenue_yen"] / totals["link_clicks"], 2) if totals["link_clicks"] else None
+        rpm = round(totals["revenue_yen"] / totals["impressions"] * 1000, 2) if totals["impressions"] else None
         if not metrics:
-            recommendation = "承認した投稿の成果を手入力すると、改善の確認点を表示します。サンプルの数字は実績と区別してください。"
+            recommendation = "投稿済みの成果を手入力すると、改善の確認点を表示します。サンプルの数字は実績と区別してください。"
         elif not totals["impressions"]:
             recommendation = "表示回数が 0 のため率を計算できません。集計期間と入力元を確認してください。"
-        elif not totals["clicks"]:
-            recommendation = "クリックはまだ 0 件です。読者・投稿内容・紹介先の関連性を一つずつ確認してください。"
+        elif not totals["link_clicks"]:
+            recommendation = "リンククリックはまだ 0 件です。読者・投稿内容・紹介先の関連性を一つずつ確認してください。"
         elif not totals["conversions"]:
             recommendation = "クリックはありますが成果は 0 件です。案件の対象者・条件と投稿の説明が一致するか確認してください。"
         else:
-            recommendation = "同じ集計期間で投稿を比較し、導入や構成を一つずつ変更して確認しましょう。少数の成果から因果関係は断定できません。"
-        summary = dict(totals, sources=len(sources), campaigns=len(campaigns), review=sum(item["status"] == "review" for item in drafts), approved=sum(item["status"] in {"approved", "exported"} for item in drafts), ctr=ctr, cvr=cvr, recommendation=recommendation)
-        return {"profile": profile, "sources": sources, "campaigns": campaigns, "drafts": drafts, "plans": plans, "matches": matches, "metrics": metrics, "analysis": analysis, "summary": summary, "audit": audit, "collection_settings": collection_settings}
+            recommendation = "同じ集計期間で投稿を比較し、フック・構成・訴求・CTAを一つずつ変更して確認しましょう。少数の成果から因果関係は断定できません。"
+        summary = dict(totals, sources=len(sources), campaigns=len(campaigns), review=sum(item["status"] == "review" for item in drafts), approved=sum(item["status"] in {"approved", "exported"} for item in drafts), published=sum(item["status"] == "published" for item in posts), ctr=ctr, cvr=cvr, epc=epc, rpm=rpm, recommendation=recommendation)
+
+        # --- 成果記録(投稿ごと): CTR/CVR/エンゲージメント率/EPC/1000impあたり報酬 -------------
+        posts_by_id = {p["id"]: p for p in posts}
+        plans_by_id = {p["id"]: p for p in plans}
+        campaigns_by_id = {c["id"]: c for c in campaigns}
+        performance = []
+        for m in metrics:
+            post = posts_by_id.get(m["post_id"])
+            if post is None:
+                continue
+            impressions = m["impressions"]
+            link_clicks = m["link_clicks"]
+            plan = plans_by_id.get(post["plan_id"]) if post["plan_id"] is not None else None
+            campaign = campaigns_by_id.get(post["campaign_id"]) if post["campaign_id"] is not None else None
+            performance.append({
+                "post_id": post["id"], "draft_id": post["draft_id"], "plan_id": post["plan_id"],
+                "campaign_id": post["campaign_id"], "source_id": post["source_id"],
+                "title": post["title"], "campaign_name": campaign["name"] if campaign else None,
+                "hook": plan["hook"] if plan else None, "structure": plan["structure"] if plan else None,
+                "appeal": plan["appeal"] if plan else None, "cta": plan["cta"] if plan else None,
+                "impressions": impressions, "likes": m["likes"], "reposts": m["reposts"], "replies": m["replies"],
+                "link_clicks": link_clicks, "conversions": m["conversions"], "revenue_yen": m["revenue_yen"],
+                "ctr": round(link_clicks / impressions * 100, 2) if impressions else None,
+                "cvr": round(m["conversions"] / link_clicks * 100, 2) if link_clicks else None,
+                "engagement_rate": round((m["likes"] + m["reposts"] + m["replies"]) / impressions * 100, 2) if impressions else None,
+                "epc": round(m["revenue_yen"] / link_clicks, 2) if link_clicks else None,
+                "rpm": round(m["revenue_yen"] / impressions * 1000, 2) if impressions else None,
+                "recorded_at": m["recorded_at"],
+            })
+
+        campaign_performance = {}
+        for row in performance:
+            cid = row["campaign_id"]
+            if cid is None:
+                continue
+            agg = campaign_performance.setdefault(cid, {
+                "campaign_id": cid, "campaign_name": row["campaign_name"],
+                "impressions": 0, "link_clicks": 0, "conversions": 0, "revenue_yen": 0, "post_count": 0,
+            })
+            agg["impressions"] += row["impressions"]
+            agg["link_clicks"] += row["link_clicks"]
+            agg["conversions"] += row["conversions"]
+            agg["revenue_yen"] += row["revenue_yen"]
+            agg["post_count"] += 1
+        campaign_performance = list(campaign_performance.values())
+        for agg in campaign_performance:
+            agg["ctr"] = round(agg["link_clicks"] / agg["impressions"] * 100, 2) if agg["impressions"] else None
+            agg["cvr"] = round(agg["conversions"] / agg["link_clicks"] * 100, 2) if agg["link_clicks"] else None
+            agg["epc"] = round(agg["revenue_yen"] / agg["link_clicks"], 2) if agg["link_clicks"] else None
+            agg["rpm"] = round(agg["revenue_yen"] / agg["impressions"] * 1000, 2) if agg["impressions"] else None
+        campaign_performance.sort(key=lambda a: -a["revenue_yen"])
+
+        # --- 「今日やること」: 次にどの工程を進めればいいかの目印 -------------------------
+        posted_draft_ids = {p["draft_id"] for p in posts}
+        plans_with_draft_ids = {d["plan_id"] for d in drafts if d["plan_id"] is not None}
+        sources_with_plan_ids = {p["source_id"] for p in plans if p["source_id"] is not None}
+        metrics_post_ids = {m["post_id"] for m in metrics}
+        tasks = {
+            "sources_pending_plan": [s["id"] for s in sources if s["id"] not in sources_with_plan_ids],
+            "approved_campaigns": [c["id"] for c in campaigns if c["status"] == "approved"],
+            "plans_pending_draft": [p["id"] for p in plans if p["id"] not in plans_with_draft_ids],
+            "drafts_pending_publish": [d["id"] for d in drafts if d["status"] in {"approved", "exported"} and d["id"] not in posted_draft_ids],
+            # "removed" matches the metrics form's own eligibility (metricsForm() in app.js keeps
+            # offering stopped posts too, since their final numbers can still be recorded).
+            "posts_pending_metrics": [p["id"] for p in posts if p["status"] != "removed" and p["id"] not in metrics_post_ids],
+        }
+
+        return {
+            "profile": profile, "sources": sources, "campaigns": campaigns, "drafts": drafts, "plans": plans,
+            "matches": matches, "posts": posts, "metrics": metrics, "performance": performance,
+            "campaign_performance": campaign_performance, "analysis": analysis, "summary": summary,
+            "tasks": tasks, "audit": audit, "collection_settings": collection_settings,
+        }
 
     def _collection_settings(self, connection):
         row = dict(connection.execute("SELECT * FROM collection_settings WHERE id=1").fetchone())
@@ -895,7 +1048,7 @@ class Store:
             ).lastrowid
             self._audit(connection, "generate_plan", "plan", record_id)
         elif path == "/api/drafts/generate-from-plan":
-            _keys(payload, {"plan_id"})
+            _keys(payload, {"plan_id", "style"})
             plan_id = _id(payload, "plan_id")
             plan = self._record(connection, "plans", plan_id)
             campaign = self._record(connection, "campaigns", plan["campaign_id"])
@@ -903,11 +1056,50 @@ class Store:
                 raise AppError("案件が提携承認済みではなくなりました。案件の状態を確認してください。", 409)
             source = self._record(connection, "sources", plan["source_id"]) if plan["source_id"] is not None else None
             profile = dict(connection.execute("SELECT * FROM profile WHERE id=1").fetchone())
-            text = self.draft_generator.generate(plan, campaign, profile)
-            title = (plan["theme"] + "の投稿案（" + campaign["name"] + "）")[:160]
+            style = _text(payload, "style", 30, required=False)
+            if style and style not in DRAFT_STYLES:
+                raise AppError("投稿スタイルが正しくありません。")
+            text = self.draft_generator.generate(plan, campaign, profile, style=style or None)
+            style_label = DRAFT_STYLES.get(style, "")
+            title = (plan["theme"] + "の投稿案" + ("（" + style_label + "）" if style_label else "") + "（" + campaign["name"] + "）")[:160]
             is_mock = bool(plan["is_mock"]) or bool(campaign["is_mock"]) or bool(source and source["is_mock"])
             record_id = self._insert_draft(connection, title, text, plan["campaign_id"], plan["source_id"], is_mock, plan_id=plan_id)
             self._audit(connection, "generate_draft_from_plan", "draft", record_id)
+        elif path == "/api/posts/publish":
+            _keys(payload, {"draft_id", "url", "posted_at"})
+            draft_id = _id(payload, "draft_id")
+            draft = self._record(connection, "drafts", draft_id)
+            if draft["status"] not in {"approved", "exported"}:
+                raise AppError("投稿済みの記録は、承認済み・書き出し済みの下書きに限られます。", 409)
+            if not self._checks(connection, draft)["passed"]:
+                raise AppError("検品に未解決のエラーがあります。再検品して修正してから記録してください。", 409)
+            url = _url(_text(payload, "url", 2048, allow_empty=False), "url", source=True)
+            posted_at = _iso_datetime(payload, "posted_at")
+            is_mock = bool(draft["is_mock"])
+            timestamp = now()
+            existing = connection.execute("SELECT id FROM posts WHERE draft_id=?", (draft_id,)).fetchone()
+            if existing:
+                # Only url/posted_at are correctable here; title/text stay as first recorded so a
+                # later draft edit can never rewrite what was actually posted.
+                record_id = existing[0]
+                connection.execute("UPDATE posts SET url=?,published_at=?,updated_at=? WHERE id=?", (url, posted_at, timestamp, record_id))
+                action = "update_published_post"
+            else:
+                record_id = connection.execute(
+                    "INSERT INTO posts(draft_id,plan_id,campaign_id,source_id,title,text,url,published_at,status,created_at,updated_at,is_mock) VALUES(?,?,?,?,?,?,?,?,'published',?,?,?)",
+                    (draft_id, draft["plan_id"], draft["campaign_id"], draft["source_id"], draft["title"], draft["text"], url, posted_at, timestamp, timestamp, int(is_mock)),
+                ).lastrowid
+                action = "publish_post"
+            self._audit(connection, action, "post", record_id)
+        elif path == "/api/posts/status":
+            _keys(payload, {"id", "status"})
+            record_id = _id(payload)
+            self._record(connection, "posts", record_id)
+            status = _text(payload, "status", 20, allow_empty=False)
+            if status not in POST_STATUSES:
+                raise AppError("投稿ステータスが正しくありません。")
+            connection.execute("UPDATE posts SET status=?,updated_at=? WHERE id=?", (status, now(), record_id))
+            self._audit(connection, "update_post_status", "post", record_id)
         elif path == "/api/drafts/save":
             _keys(payload, {"id", "title", "text", "campaign_id", "source_id"})
             record_id = _id(payload, required=False)
@@ -943,20 +1135,21 @@ class Store:
                 prefix = "【サンプル・公開不可】\n以下は架空データを使った練習用の投稿です。公開に使わないでください。\n\n" if is_mock else ""
                 return {"text": prefix + draft["text"], "filename": ("sample-" if is_mock else "") + "draft-" + str(record_id) + ".txt", "is_mock": is_mock}
         elif path == "/api/metrics":
-            _keys(payload, {"draft_id", "impressions", "clicks", "conversions", "revenue_yen"})
-            draft_id = _id(payload, "draft_id")
-            draft = self._record(connection, "drafts", draft_id)
-            if draft["status"] not in {"approved", "exported"}:
-                raise AppError("成果は承認済み・書き出し済みの投稿に入力してください。", 409)
-            values = [_integer(payload, key) for key in ("impressions", "clicks", "conversions", "revenue_yen")]
-            if not values[2] <= values[1] <= values[0]:
-                raise AppError("成果件数 ≦ クリック数 ≦ 表示回数になるよう入力してください。")
-            existing = connection.execute("SELECT id FROM metrics WHERE draft_id=?", (draft_id,)).fetchone()
+            _keys(payload, {"post_id", "impressions", "likes", "reposts", "replies", "link_clicks", "conversions", "revenue_yen"})
+            post_id = _id(payload, "post_id")
+            self._record(connection, "posts", post_id)
+            values = [_integer(payload, key) for key in ("impressions", "likes", "reposts", "replies", "link_clicks", "conversions", "revenue_yen")]
+            impressions, likes, reposts, replies, link_clicks, conversions, revenue_yen = values
+            if not conversions <= link_clicks <= impressions:
+                raise AppError("成果件数 ≦ リンククリック数 ≦ 表示回数になるよう入力してください。")
+            if likes > impressions or reposts > impressions or replies > impressions:
+                raise AppError("いいね・リポスト・返信は表示回数を超えないように入力してください。")
+            existing = connection.execute("SELECT id FROM metrics WHERE post_id=?", (post_id,)).fetchone()
             if existing:
                 record_id = existing[0]
-                connection.execute("UPDATE metrics SET impressions=?,clicks=?,conversions=?,revenue_yen=?,recorded_at=? WHERE id=?", tuple(values) + (now(), record_id))
+                connection.execute("UPDATE metrics SET impressions=?,likes=?,reposts=?,replies=?,link_clicks=?,conversions=?,revenue_yen=?,recorded_at=? WHERE id=?", tuple(values) + (now(), record_id))
             else:
-                record_id = connection.execute("INSERT INTO metrics(draft_id,impressions,clicks,conversions,revenue_yen,recorded_at) VALUES(?,?,?,?,?,?)", (draft_id,) + tuple(values) + (now(),)).lastrowid
+                record_id = connection.execute("INSERT INTO metrics(post_id,impressions,likes,reposts,replies,link_clicks,conversions,revenue_yen,recorded_at) VALUES(?,?,?,?,?,?,?,?,?)", (post_id,) + tuple(values) + (now(),)).lastrowid
             self._audit(connection, "upsert_metrics", "metric", record_id)
         else:
             raise AppError("API が見つかりません。", 404)

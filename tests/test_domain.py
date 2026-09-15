@@ -1,8 +1,18 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from app.domain import AppError, MockSourceProvider, RuleBasedAnalyzer, RuleBasedMatcher, Store, buzz_score
+from app.domain import (
+    AppError,
+    DRAFT_STYLES,
+    MockSourceProvider,
+    RuleBasedAnalyzer,
+    RuleBasedDraftGenerator,
+    RuleBasedMatcher,
+    Store,
+    buzz_score,
+)
 
 
 class WorkflowTest(unittest.TestCase):
@@ -51,17 +61,184 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual("draft", changed["status"])
         self.assertIsNone(changed["checks"])
 
+    def _approve(self, draft_id):
+        self.store.mutate("/api/drafts/check", {"id": draft_id})
+        return self.store.mutate("/api/drafts/approve", {"id": draft_id, "confirmed": True})
+
+    def _publish(self, draft_id, url="https://x.com/myaccount/status/999", posted_at="2026-09-15T09:00:00Z"):
+        state = self.store.mutate("/api/posts/publish", {"draft_id": draft_id, "url": url, "posted_at": posted_at})
+        return next(p for p in state["posts"] if p["draft_id"] == draft_id)
+
     def test_metrics_are_cumulative_and_consistent(self):
         draft = self.store.state()["drafts"][0]
-        self.store.mutate("/api/drafts/check", {"id": draft["id"]})
-        self.store.mutate("/api/drafts/approve", {"id": draft["id"], "confirmed": True})
-        state = self.store.mutate("/api/metrics", {"draft_id": draft["id"], "impressions": 1000, "clicks": 20, "conversions": 2, "revenue_yen": 1000})
+        self._approve(draft["id"])
+        post = self._publish(draft["id"])
+        state = self.store.mutate("/api/metrics", {"post_id": post["id"], "impressions": 1000, "likes": 30, "reposts": 5, "replies": 2, "link_clicks": 20, "conversions": 2, "revenue_yen": 1000})
         self.assertEqual(2.0, state["summary"]["ctr"])
-        state = self.store.mutate("/api/metrics", {"draft_id": draft["id"], "impressions": 2000, "clicks": 50, "conversions": 5, "revenue_yen": 2500})
+        state = self.store.mutate("/api/metrics", {"post_id": post["id"], "impressions": 2000, "likes": 60, "reposts": 10, "replies": 4, "link_clicks": 50, "conversions": 5, "revenue_yen": 2500})
         self.assertEqual(1, len(state["metrics"]))
         self.assertEqual(2000, state["summary"]["impressions"])
         with self.assertRaises(AppError):
-            self.store.mutate("/api/metrics", {"draft_id": draft["id"], "impressions": 1, "clicks": 2, "conversions": 0, "revenue_yen": 0})
+            self.store.mutate("/api/metrics", {"post_id": post["id"], "impressions": 1, "likes": 0, "reposts": 0, "replies": 0, "link_clicks": 2, "conversions": 0, "revenue_yen": 0})
+
+    def test_publish_requires_approved_or_exported_draft(self):
+        draft = self.store.state()["drafts"][0]  # still status='draft'
+        with self.assertRaises(AppError) as error:
+            self.store.mutate("/api/posts/publish", {"draft_id": draft["id"], "url": "https://x.com/myaccount/status/1", "posted_at": "2026-09-15T09:00:00Z"})
+        self.assertEqual(409, error.exception.status)
+
+    def test_publish_rejects_invalid_x_url(self):
+        draft = self.store.state()["drafts"][0]
+        self._approve(draft["id"])
+        for bad_url in ("https://example.com/not-x", "not-a-url", "https://x.com/justahandle"):
+            with self.assertRaises(AppError):
+                self.store.mutate("/api/posts/publish", {"draft_id": draft["id"], "url": bad_url, "posted_at": "2026-09-15T09:00:00Z"})
+
+    def test_published_post_links_campaign_plan_draft_source(self):
+        state = self.store.state()
+        campaign = self.approved_campaign()
+        source = state["sources"][0]
+        state = self.store.mutate("/api/plans/generate", {"campaign_id": campaign["id"], "source_id": source["id"], "angle": ""})
+        plan = state["plans"][0]
+        state = self.store.mutate("/api/drafts/generate-from-plan", {"plan_id": plan["id"]})
+        draft = state["drafts"][0]
+        self._approve(draft["id"])
+        post = self._publish(draft["id"])
+        self.assertEqual(draft["id"], post["draft_id"])
+        self.assertEqual(plan["id"], post["plan_id"])
+        self.assertEqual(campaign["id"], post["campaign_id"])
+        self.assertEqual(source["id"], post["source_id"])
+        self.assertEqual("published", post["status"])
+
+        state = self.store.mutate("/api/posts/status", {"id": post["id"], "status": "stopped"})
+        updated = next(p for p in state["posts"] if p["id"] == post["id"])
+        self.assertEqual("stopped", updated["status"])
+        with self.assertRaises(AppError):
+            self.store.mutate("/api/posts/status", {"id": post["id"], "status": "not-a-status"})
+
+    def test_published_post_snapshots_title_and_text_unaffected_by_later_draft_edits(self):
+        draft = self.store.state()["drafts"][0]
+        original_text = draft["text"]
+        self._approve(draft["id"])
+        post = self._publish(draft["id"])
+        self.assertEqual(original_text, post["text"])
+        self.assertEqual(draft["title"], post["title"])
+
+        # Editing the draft afterward must not retroactively rewrite what was actually posted.
+        state = self.store.mutate("/api/drafts/save", {
+            "id": draft["id"], "title": "編集後のタイトル", "text": original_text + "\n後から追記",
+            "campaign_id": draft["campaign_id"], "source_id": draft["source_id"],
+        })
+        still_posted = next(p for p in state["posts"] if p["id"] == post["id"])
+        self.assertEqual(original_text, still_posted["text"])
+        self.assertEqual(draft["title"], still_posted["title"])
+
+    def test_stopped_post_still_counts_toward_pending_metrics_task(self):
+        draft = self.store.state()["drafts"][0]
+        self._approve(draft["id"])
+        post = self._publish(draft["id"])
+        state = self.store.mutate("/api/posts/status", {"id": post["id"], "status": "stopped"})
+        self.assertIn(post["id"], state["tasks"]["posts_pending_metrics"])
+
+    def test_performance_calculates_ctr_cvr_epc_rpm(self):
+        draft = self.store.state()["drafts"][0]
+        self._approve(draft["id"])
+        post = self._publish(draft["id"])
+        state = self.store.mutate("/api/metrics", {"post_id": post["id"], "impressions": 1000, "likes": 40, "reposts": 10, "replies": 5, "link_clicks": 50, "conversions": 5, "revenue_yen": 2500})
+        perf = next(p for p in state["performance"] if p["post_id"] == post["id"])
+        self.assertEqual(5.0, perf["ctr"])
+        self.assertEqual(10.0, perf["cvr"])
+        self.assertEqual(5.5, perf["engagement_rate"])
+        self.assertEqual(50.0, perf["epc"])
+        self.assertEqual(2500.0, perf["rpm"])
+        self.assertEqual(post["campaign_id"], perf["campaign_id"])
+
+    def test_performance_handles_zero_revenue(self):
+        draft = self.store.state()["drafts"][0]
+        self._approve(draft["id"])
+        post = self._publish(draft["id"])
+        state = self.store.mutate("/api/metrics", {"post_id": post["id"], "impressions": 1000, "likes": 10, "reposts": 2, "replies": 1, "link_clicks": 30, "conversions": 0, "revenue_yen": 0})
+        perf = next(p for p in state["performance"] if p["post_id"] == post["id"])
+        self.assertEqual(0.0, perf["epc"])
+        self.assertEqual(0.0, perf["rpm"])
+        self.assertEqual(0.0, perf["cvr"])
+
+    def test_performance_avoids_division_by_zero_when_impressions_or_clicks_are_zero(self):
+        draft = self.store.state()["drafts"][0]
+        self._approve(draft["id"])
+        post = self._publish(draft["id"])
+        state = self.store.mutate("/api/metrics", {"post_id": post["id"], "impressions": 0, "likes": 0, "reposts": 0, "replies": 0, "link_clicks": 0, "conversions": 0, "revenue_yen": 0})
+        perf = next(p for p in state["performance"] if p["post_id"] == post["id"])
+        self.assertIsNone(perf["ctr"])
+        self.assertIsNone(perf["cvr"])
+        self.assertIsNone(perf["engagement_rate"])
+        self.assertIsNone(perf["epc"])
+        self.assertIsNone(perf["rpm"])
+        self.assertIsNone(state["summary"]["ctr"])
+
+        state = self.store.mutate("/api/metrics", {"post_id": post["id"], "impressions": 500, "likes": 5, "reposts": 1, "replies": 0, "link_clicks": 0, "conversions": 0, "revenue_yen": 0})
+        perf = next(p for p in state["performance"] if p["post_id"] == post["id"])
+        self.assertEqual(0.0, perf["ctr"])
+        self.assertIsNone(perf["cvr"])
+        self.assertIsNone(perf["epc"])
+
+    def test_draft_style_variants_produce_distinct_texts(self):
+        state = self.store.state()
+        campaign = self.approved_campaign()
+        source = state["sources"][0]
+        state = self.store.mutate("/api/plans/generate", {"campaign_id": campaign["id"], "source_id": source["id"], "angle": ""})
+        plan = state["plans"][0]
+        texts = {}
+        for style in DRAFT_STYLES:
+            state = self.store.mutate("/api/drafts/generate-from-plan", {"plan_id": plan["id"], "style": style})
+            draft = state["drafts"][0]
+            self.assertNotIn(source["text"], draft["text"])
+            self.assertIn("【PR】", draft["text"])
+            self.assertIn(campaign["affiliate_url"], draft["text"])
+            texts[style] = draft["text"]
+        self.assertEqual(len(DRAFT_STYLES), len({t for t in texts.values()}))
+        with self.assertRaises(AppError):
+            self.store.mutate("/api/drafts/generate-from-plan", {"plan_id": plan["id"], "style": "not-a-style"})
+
+    def test_metrics_table_migrates_from_old_draft_based_schema(self):
+        db_path = Path(self.temp.name) / "old-metrics.sqlite3"
+        conn = sqlite3.connect(str(db_path))
+        # meta.initialized=1 so Store skips demo seeding; only drafts/metrics use the pre-posts-feature schema.
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO meta(key,value) VALUES('initialized','1')")
+        conn.execute("""CREATE TABLE profile (
+            id INTEGER PRIMARY KEY CHECK(id=1), name TEXT NOT NULL, bio TEXT NOT NULL,
+            audience TEXT NOT NULL, niche TEXT NOT NULL, tone TEXT NOT NULL, pillars TEXT NOT NULL
+        )""")
+        conn.execute("INSERT INTO profile(id,name,bio,audience,niche,tone,pillars) VALUES(1,'旧プロフィール','','','','','')")
+        conn.execute("""CREATE TABLE drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, text TEXT NOT NULL,
+            campaign_id INTEGER, source_id INTEGER, status TEXT NOT NULL, checks TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, is_mock INTEGER NOT NULL
+        )""")
+        conn.execute("INSERT INTO drafts(id,title,text,campaign_id,source_id,status,checks,created_at,updated_at,is_mock) VALUES(1,'旧下書き','本文です',NULL,NULL,'approved',NULL,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',0)")
+        conn.execute("""CREATE TABLE metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER NOT NULL UNIQUE,
+            impressions INTEGER NOT NULL, clicks INTEGER NOT NULL, conversions INTEGER NOT NULL,
+            revenue_yen INTEGER NOT NULL, recorded_at TEXT NOT NULL
+        )""")
+        conn.execute("INSERT INTO metrics(draft_id,impressions,clicks,conversions,revenue_yen,recorded_at) VALUES(1,100,10,1,500,'2026-01-01T00:00:00Z')")
+        conn.commit()
+        conn.close()
+
+        migrated = Store(db_path)
+        state = migrated.state()
+        self.assertEqual(1, len(state["drafts"]))  # no demo seeding ran; only the pre-existing draft is present
+        self.assertEqual([], state["metrics"])  # old draft-linked rows can't map onto a post; table is rebuilt empty
+        self.assertIn("migrate_drop_old_metrics", {a["action"] for a in state["audit"]})  # destructive migration is logged, not silent
+        draft = state["drafts"][0]
+        migrated.mutate("/api/drafts/check", {"id": draft["id"]})
+        migrated.mutate("/api/drafts/approve", {"id": draft["id"], "confirmed": True})
+        state = migrated.mutate("/api/posts/publish", {"draft_id": draft["id"], "url": "https://x.com/myaccount/status/1", "posted_at": "2026-09-15T09:00:00Z"})
+        post = state["posts"][0]
+        state = migrated.mutate("/api/metrics", {"post_id": post["id"], "impressions": 100, "likes": 5, "reposts": 1, "replies": 0, "link_clicks": 10, "conversions": 1, "revenue_yen": 500})
+        self.assertEqual(1, len(state["metrics"]))
+        migrated.close()
 
     def test_live_mode_fails_closed(self):
         live = Store(Path(self.temp.name) / "live.sqlite3", mode="live")
@@ -276,6 +453,19 @@ class PureFunctionTest(unittest.TestCase):
         self.assertTrue(0 <= aligned["score"] <= 100)
         self.assertTrue(0 <= mismatched["score"] <= 100)
         self.assertTrue(aligned["reasons"])
+
+    def test_rule_based_draft_generator_produces_distinct_styles(self):
+        plan = {"theme": "節約術", "target": "家計を見直したい人", "hook": "statement", "structure": "narrative", "cta": "none"}
+        campaign = {"name": "架空案件", "affiliate_url": "https://example.com/aff"}
+        profile = {"audience": "家計を見直したい人"}
+        gen = RuleBasedDraftGenerator()
+        texts = {style: gen.generate(plan, campaign, profile, style=style) for style in DRAFT_STYLES}
+        self.assertEqual(len(DRAFT_STYLES), len(set(texts.values())))
+        for text in texts.values():
+            self.assertIn("【PR】", text)
+            self.assertIn(campaign["affiliate_url"], text)
+        auto = gen.generate(plan, campaign, profile)  # style省略時は structure から自動選択される
+        self.assertIn(auto, texts.values())
 
     def test_mock_source_provider_filters_by_genre_and_keyword(self):
         provider = MockSourceProvider()
