@@ -120,7 +120,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path = urlsplit(self.path).path
             result = self.server.store.mutate(path, payload)
-            self.send_body(200, result if path == "/api/drafts/export" else self.state())
+            if path != "/api/drafts/export":
+                result["csrfToken"] = self.server.csrf_token
+                result["config"] = {"mode": "mock", "liveEnabled": False}
+            self.send_body(200, result)
         except AppError as exc:
             self.send_body(exc.status, {"error": str(exc)})
         except (BrokenPipeError, ConnectionResetError):

@@ -271,6 +271,13 @@ class RuleBasedAnalyzer(ContentAnalyzer):
 
 DEFAULT_ANALYZER = RuleBasedAnalyzer()
 
+# 表示用ラベルは analyzer の structure 分類をそのまま流用し、分類ルールを一箇所に保つ。
+PATTERN_LABELS = {
+    "question": ("問いかけ", "読者が答えられる問いの置き方を検討。反応との因果関係は、この数字だけでは判断できません。"),
+    "list": ("要点・比較", "要点を先に示す構成を検討。原文を転載せず、自分のテーマと根拠で作成してください。"),
+    "narrative": ("短い導入", "一つのテーマに絞る構成を検討。表示数や投稿条件の違いも確認してください。"),
+}
+
 # 投稿案生成で使うテンプレート。参考にするのは分類ラベルのみで、原文は一切使わない。
 HOOK_TEMPLATES = {
     "question": "{theme}について、こう感じたことはありませんか？",
@@ -493,14 +500,13 @@ class Store:
         for source in sources:
             impressions = source["impressions"]
             interactions = source["likes"] + source["reposts"] + source["replies"]
-            weighted = source["likes"] + source["reposts"] * 2 + source["replies"] * 1.5
-            if "？" in source["text"] or "?" in source["text"]:
-                pattern, lesson = "問いかけ", "読者が答えられる問いの置き方を検討。反応との因果関係は、この数字だけでは判断できません。"
-            elif any(word in source["text"] for word in ("項目", "観点", "：", "1.", "①")):
-                pattern, lesson = "要点・比較", "要点を先に示す構成を検討。原文を転載せず、自分のテーマと根拠で作成してください。"
-            else:
-                pattern, lesson = "短い導入", "一つのテーマに絞る構成を検討。表示数や投稿条件の違いも確認してください。"
+            weighted = (
+                source["likes"] * BUZZ_SCORE_WEIGHTS["like"]
+                + source["reposts"] * BUZZ_SCORE_WEIGHTS["repost"]
+                + source["replies"] * BUZZ_SCORE_WEIGHTS["reply"]
+            )
             content = self.analyzer.analyze(source["text"], source["topic"], "")
+            pattern, lesson = PATTERN_LABELS.get(content["structure"], PATTERN_LABELS["narrative"])
             analysis.append({
                 "source_id": source["id"],
                 "engagement_rate": round(interactions / impressions * 100, 2) if impressions else None,
